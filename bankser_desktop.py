@@ -12,12 +12,23 @@ A Linux Mint inspired desktop environment built with PySide6.
   * MATRIX RAIN - a cmatrix style digital rain of falling glyphs
   * PASTESHELL ASCII tool built into the desktop
 
-Run:  python bankser_desktop.py
+New in 2.1
+  * Holographic HUD boot sequence (replay with 'boot' in the terminal)
+  * Glass windows, aurora wallpaper, floating dock with open-app dots
+  * App launcher with search + theme swatches (Ctrl+Space)
+  * Live system monitor (CPU / memory / disk / network / processes)
+  * Real music player, real file browser, autosaving searchable notes
+  * Terminal history, Tab completion, neofetch, calc, ls/cd, top, ...
+  * Calendar, volume and power menus in the top panel; toasts
+
+Run:  python bankser_desktop.py   (pip install PySide6 psutil)
 """
 
+import array
 import concurrent.futures
 import html
 import ipaddress
+import itertools
 import json
 import math
 import os
@@ -32,31 +43,51 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote_plus
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRect, QRectF, QPointF, QPoint, QPropertyAnimation, QEasingCurve
+    Qt, QTimer, QRect, QRectF, QPointF, QPoint, QPropertyAnimation,
+    QEasingCurve, QUrl, Property, QSize, QEvent
 )
 from PySide6.QtGui import (
     QColor, QPainter, QPen, QFont, QFontDatabase, QFontMetricsF,
     QLinearGradient, QRadialGradient, QPainterPath, QKeySequence,
-    QTextCursor, QTextCharFormat, QImage
+    QTextCursor, QTextCharFormat, QImage, QIcon, QPixmap, QShortcut, QBrush,
+    QConicalGradient
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGridLayout, QTextEdit, QLineEdit,
-    QListWidget, QMessageBox, QGraphicsDropShadowEffect, QMenu,
-    QAbstractButton, QSizePolicy, QSlider, QColorDialog, QFileDialog
+    QListWidget, QListWidgetItem, QMessageBox, QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect, QMenu, QAbstractButton, QSizePolicy, QSlider,
+    QColorDialog, QFileDialog, QToolButton, QCalendarWidget, QWidgetAction
 )
+
+try:
+    import psutil          # live CPU / memory / disk / network / processes
+except ImportError:
+    psutil = None
+
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+except ImportError:
+    QMediaPlayer = QAudioOutput = None
+
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma"}
+
+# stops ping/netsh flashing console windows when run with pythonw
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ==========================================================
 # CONSTANTS / THEME
 # ==========================================================
 
 APP_NAME = "BANKSER'"
-VERSION = "2.0"
+VERSION = "2.1"
+BOOT_STYLE = "hud"          # "hud" = holographic boot, "classic" = Mint splash
 
 HOME = Path.home() / ".bankser"
 HOME.mkdir(exist_ok=True)
@@ -82,6 +113,12 @@ def _mix(color_a, color_b, ratio):
     green = int(round(a.green() + (b.green() - a.green()) * ratio))
     blue = int(round(a.blue() + (b.blue() - a.blue()) * ratio))
     return "#%02x%02x%02x" % (red, green, blue)
+
+
+def _rgba(hex_color, alpha):
+    """Hex colour -> QSS rgba() string with the given alpha (0-255)."""
+    c = QColor(hex_color)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
 
 
 class Theme:
@@ -116,11 +153,15 @@ class Theme:
         self.button_border = _mix("#595959", accent, 0.22)
         self.gauge_track = _mix("#3d3d3d", accent_dark, 0.14)
 
-        rgb = QColor(accent)
-        self.accent_soft = (f"rgba({rgb.red()}, {rgb.green()}, "
-                            f"{rgb.blue()}, 45)")
-        self.accent_faint = (f"rgba({rgb.red()}, {rgb.green()}, "
-                             f"{rgb.blue()}, 26)")
+        self.accent_soft = _rgba(accent, 45)
+        self.accent_faint = _rgba(accent, 26)
+
+        # translucent "glass" surfaces that let the wallpaper glow through
+        self.panel_glass = _rgba(_mix("#15181a", accent_dark, 0.10), 205)
+        self.window_glass = _rgba(_mix("#202322", accent_dark, 0.12), 228)
+        self.header_glass = _rgba(_mix("#2a2e2c", accent_dark, 0.16), 235)
+        self.deep_glass = _rgba(_mix("#121514", accent_dark, 0.10), 215)
+        self.hairline = "rgba(255, 255, 255, 22)"
 
         # wallpaper
         self.wallpaper_top = _mix("#0a0f08", accent_dark, 0.12)
@@ -509,6 +550,86 @@ def draw_icon(painter, kind, box, color, weight=1.7):
         painter.drawLine(QPointF(cx, y + h * 0.76),
                          QPointF(cx, y + h * 0.16))
 
+    elif kind in ("play", "next", "prev"):
+        painter.setBrush(color)
+        painter.setPen(Qt.NoPen)
+        if kind == "play":
+            path = QPainterPath()
+            path.moveTo(x + w * 0.32, y + h * 0.20)
+            path.lineTo(x + w * 0.80, cy)
+            path.lineTo(x + w * 0.32, y + h * 0.80)
+            path.closeSubpath()
+            painter.drawPath(path)
+        else:
+            sign = 1 if kind == "next" else -1
+            for offset in (-0.17, 0.05):
+                ox = cx + sign * w * offset
+                path = QPainterPath()
+                path.moveTo(ox - sign * w * 0.16, y + h * 0.28)
+                path.lineTo(ox + sign * w * 0.12, cy)
+                path.lineTo(ox - sign * w * 0.16, y + h * 0.72)
+                path.closeSubpath()
+                painter.drawPath(path)
+            painter.drawRect(QRectF(cx + sign * w * 0.18 - w * 0.04,
+                                    y + h * 0.28, w * 0.08, h * 0.44))
+        painter.setBrush(Qt.NoBrush)
+
+    elif kind == "pause":
+        painter.setBrush(color)
+        painter.setPen(Qt.NoPen)
+        for left in (0.28, 0.56):
+            painter.drawRoundedRect(
+                QRectF(x + w * left, y + h * 0.22, w * 0.16, h * 0.56), 2, 2)
+        painter.setBrush(Qt.NoBrush)
+
+    elif kind == "up":
+        painter.drawLine(QPointF(cx, y + h * 0.80), QPointF(cx, y + h * 0.22))
+        painter.drawLine(QPointF(x + w * 0.28, y + h * 0.44),
+                         QPointF(cx, y + h * 0.22))
+        painter.drawLine(QPointF(x + w * 0.72, y + h * 0.44),
+                         QPointF(cx, y + h * 0.22))
+
+    elif kind == "home":
+        path = QPainterPath()
+        path.moveTo(x + w * 0.16, y + h * 0.48)
+        path.lineTo(cx, y + h * 0.16)
+        path.lineTo(x + w * 0.84, y + h * 0.48)
+        painter.drawPath(path)
+        painter.drawRoundedRect(
+            QRectF(x + w * 0.26, y + h * 0.42, w * 0.48, h * 0.42), 2, 2)
+
+    elif kind == "file":
+        path = QPainterPath()
+        path.moveTo(x + w * 0.26, y + h * 0.12)
+        path.lineTo(x + w * 0.58, y + h * 0.12)
+        path.lineTo(x + w * 0.76, y + h * 0.30)
+        path.lineTo(x + w * 0.76, y + h * 0.88)
+        path.lineTo(x + w * 0.26, y + h * 0.88)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawLine(QPointF(x + w * 0.58, y + h * 0.12),
+                         QPointF(x + w * 0.58, y + h * 0.30))
+        painter.drawLine(QPointF(x + w * 0.58, y + h * 0.30),
+                         QPointF(x + w * 0.76, y + h * 0.30))
+
+    elif kind == "search":
+        painter.drawEllipse(QRectF(x + w * 0.18, y + h * 0.18,
+                                   w * 0.46, h * 0.46))
+        painter.drawLine(QPointF(x + w * 0.58, y + h * 0.58),
+                         QPointF(x + w * 0.82, y + h * 0.82))
+
+
+def icon_pixmap(kind, size, color):
+    """Render a symbolic icon into a QIcon (for menus, tiles and lists)."""
+    pixmap = QPixmap(size * 2, size * 2)          # 2x for crisp HiDPI
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    draw_icon(painter, kind, QRectF(0, 0, size, size), QColor(color))
+    painter.end()
+    return QIcon(pixmap)
+
 
 THEME_ICONS = []
 
@@ -542,7 +663,7 @@ class IconButton(QAbstractButton):
         self.kind = kind
         self.theme_bound = theme_bound
         self.color = QColor(color) if color else QColor(TEXT)
-        self.hover = QColor(hover) if hover else QColor(MINT_LIGHT)
+        self.hover = QColor(hover) if hover else None   # None = follow theme
         self._hovered = False
         self.setFixedSize(size, size)
         self.setToolTip(tooltip)
@@ -561,33 +682,141 @@ class IconButton(QAbstractButton):
         painter.setRenderHint(QPainter.Antialiasing)
 
         if self._hovered:
-            hover_tint = QColor(MINT)
+            hover_tint = QColor(self.hover if self.hover is not None
+                                else MINT)
             hover_tint.setAlpha(45)
             painter.setBrush(hover_tint)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(self.rect().adjusted(0, 3, 0, 3), 7, 7)
+            painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 7, 7)
             painter.setBrush(Qt.NoBrush)
 
-        if self.theme_bound:
-            base = QColor(TEXT_DIM)
-            accent = self.hover if self.hover != QColor(MINT_LIGHT) \
-                else QColor(MINT_LIGHT)
-        else:
-            base = self.color
-            accent = self.hover
+        base = QColor(TEXT_DIM) if self.theme_bound else self.color
+        accent = self.hover if self.hover is not None else QColor(MINT_LIGHT)
 
         color = accent if self._hovered else base
+        side = min(self.width(), self.height())     # icon stays square
         draw_icon(painter, self.kind,
-                  QRectF(0, 0, self.width(), self.height()), color)
+                  QRectF((self.width() - side) / 2, 0, side, side), color)
+
+
+class DockButton(IconButton):
+    """The original flat dock icon, plus a dot while its app is open."""
+
+    def __init__(self, kind, tooltip, is_running=None, size=36, parent=None):
+        super().__init__(kind, tooltip, size, theme_bound=True, parent=parent)
+        self.setFixedSize(size, size + 6)            # room for the dot
+        self.is_running = is_running
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.is_running and self.is_running():
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(MINT_LIGHT))
+            painter.drawEllipse(QPointF(self.width() / 2, self.height() - 3),
+                                2.4, 2.4)
 
 
 # ==========================================================
-# WALLPAPER  (Mint green hills)
+# TOAST NOTIFICATIONS
+# ==========================================================
+
+class Toast(QLabel):
+    """Small glass notification that fades in at the top right and away."""
+
+    def __init__(self, parent, text):
+        super().__init__(text, parent)
+        self.setStyleSheet(f"""
+            background: {CURRENT_THEME.header_glass};
+            color: {TEXT};
+            border: 1px solid {MINT};
+            border-radius: 10px;
+            padding: 10px 16px;
+            font-size: 12px;
+        """)
+        self.adjustSize()
+        self.move(parent.width() - self.width() - 18, 46)
+
+        effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(effect)
+        self._fade = QPropertyAnimation(effect, b"opacity", self)
+        self._fade.setDuration(220)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self.show()
+        self.raise_()
+        self._fade.start()
+        QTimer.singleShot(2600, self._fade_out)
+
+    def _fade_out(self):
+        self._fade.setDirection(QPropertyAnimation.Backward)
+        self._fade.finished.connect(self.deleteLater)
+        self._fade.start()
+
+
+# ==========================================================
+# SPARKLINE  (CPU history graph in the monitor)
+# ==========================================================
+
+class Sparkline(QWidget):
+    def __init__(self, parent=None, points=60):
+        super().__init__(parent)
+        self.values = [0.0] * points
+        self.setMinimumHeight(54)
+
+    def push(self, value):
+        self.values = self.values[1:] + [value]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        step = w / max(1, len(self.values) - 1)
+
+        line = QPainterPath()
+        for i, value in enumerate(self.values):
+            point = QPointF(i * step, h - 2 - (h - 4) * value / 100.0)
+            line.moveTo(point) if i == 0 else line.lineTo(point)
+
+        area = QPainterPath(line)
+        area.lineTo(w, h)
+        area.lineTo(0, h)
+        area.closeSubpath()
+        fill = QLinearGradient(0, 0, 0, h)
+        top = QColor(MINT)
+        top.setAlpha(110)
+        fill.setColorAt(0, top)
+        fill.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.fillPath(area, fill)
+
+        painter.setPen(QPen(QColor(MINT_LIGHT), 1.6))
+        painter.drawPath(line)
+
+
+# ==========================================================
+# WALLPAPER  (aurora sky over Mint hills)
 # ==========================================================
 
 class Wallpaper(QWidget):
+    """Painted once per size/theme into a pixmap; repaints just blit it
+    (the glass windows on top make the wallpaper repaint constantly)."""
+
+    _cache_key = None
+
     def paintEvent(self, event):
-        painter = QPainter(self)
+        ratio = self.devicePixelRatioF()
+        key = (self.width(), self.height(), ratio, CURRENT_THEME.index)
+        if key != self._cache_key:
+            self._cache = QPixmap(int(self.width() * ratio),
+                                  int(self.height() * ratio))
+            self._cache.setDevicePixelRatio(ratio)
+            self._render(QPainter(self._cache))
+            self._cache_key = key
+        QPainter(self).drawPixmap(0, 0, self._cache)
+
+    def _render(self, painter):
         painter.setRenderHint(QPainter.Antialiasing)
 
         rect = self.rect()
@@ -598,6 +827,27 @@ class Wallpaper(QWidget):
         gradient.setColorAt(0.45, QColor(WALLPAPER_MID))
         gradient.setColorAt(1.0, QColor(WALLPAPER_BOTTOM))
         painter.fillRect(rect, gradient)
+
+        # starfield - seeded so the stars stay put between repaints
+        stars = random.Random(1337)
+        painter.setPen(Qt.NoPen)
+        for _ in range(int(w * h / 5200)):
+            sx, sy = stars.random() * w, stars.random() * h * 0.62
+            size = stars.choice((0.6, 0.8, 1.0, 1.4))
+            painter.setBrush(QColor(255, 255, 255, stars.randint(40, 190)))
+            painter.drawEllipse(QPointF(sx, sy), size, size)
+
+        # soft aurora blobs in the theme colours
+        for fx, fy, radius, colour, alpha in (
+                (0.18, 0.22, 0.42, MINT, 70),
+                (0.78, 0.14, 0.38, MINT_LIGHT, 45),
+                (0.55, 0.40, 0.30, MINT_DARK, 60)):
+            blob = QRadialGradient(w * fx, h * fy, w * radius)
+            tint = QColor(colour)
+            tint.setAlpha(alpha)
+            blob.setColorAt(0, tint)
+            blob.setColorAt(1, QColor(0, 0, 0, 0))
+            painter.fillRect(rect, blob)
 
         glow = QRadialGradient(w * 0.5, h * 0.92, w * 0.62)
         glow_color = QColor(MINT)
@@ -629,6 +879,12 @@ class Wallpaper(QWidget):
                                w * 1.44, h * 0.55)
             painter.drawPath(self._hill(rect_hill))
 
+        # vignette pulls the eye to the centre
+        vignette = QRadialGradient(w * 0.5, h * 0.5, max(w, h) * 0.75)
+        vignette.setColorAt(0.6, QColor(0, 0, 0, 0))
+        vignette.setColorAt(1.0, QColor(0, 0, 0, 120))
+        painter.fillRect(rect, vignette)
+
         painter.end()
 
     @staticmethod
@@ -651,23 +907,106 @@ QWidget {
     color: %(text)s;
 }
 
+/* app windows (bankserAI, ART, ...) are real OS windows: solid, square */
 QFrame#mintwindow {
     background: %(win)s;
     border: 1px solid %(border)s;
-    border-radius: 8px;
 }
 
 QWidget#winheader {
     background: %(header)s;
     border-bottom: 1px solid %(border)s;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
+}
+
+/* panels on the desktop are glass over the wallpaper, with round corners */
+QWidget#desktopbody QFrame#mintwindow {
+    background: %(win_glass)s;
+    border: 1px solid %(hairline)s;
+    border-radius: 12px;
+}
+
+QWidget#desktopbody QWidget#winheader {
+    background: %(header_glass)s;
+    border-bottom: 1px solid %(hairline)s;
+    border-top-left-radius: 11px;
+    border-top-right-radius: 11px;
 }
 
 QLabel#wintitle {
     color: %(text)s;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: bold;
+}
+
+QLabel#status {
+    color: %(muted)s;
+    font-size: 10px;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: %(button_bg)s;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background: %(mint)s;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: %(mint_light)s;
+    width: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}
+
+QMenu {
+    background: %(header)s;
+    color: %(text)s;
+    border: 1px solid %(border)s;
+    border-radius: 10px;
+    padding: 6px;
+}
+
+QMenu::item {
+    padding: 7px 26px 7px 12px;
+    border-radius: 6px;
+}
+
+QMenu::item:selected {
+    background: %(mint)s;
+    color: %(on_accent)s;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: %(border)s;
+    margin: 5px 8px;
+}
+
+QCalendarWidget QWidget {
+    alternate-background-color: %(deep)s;
+}
+
+QCalendarWidget QWidget#qt_calendar_navigationbar {
+    background: %(header)s;
+}
+
+QCalendarWidget QToolButton {
+    background: transparent;
+    color: %(text)s;
+    border: none;
+    padding: 4px 8px;
+    font-weight: bold;
+}
+
+QCalendarWidget QAbstractItemView {
+    background: %(deep)s;
+    color: %(text)s;
+    selection-background-color: %(mint)s;
+    selection-color: %(on_accent)s;
+    border: none;
 }
 
 QLabel {
@@ -701,8 +1040,8 @@ QPushButton {
     background: %(button_bg)s;
     color: %(text)s;
     border: 1px solid %(button_border)s;
-    border-radius: 6px;
-    padding: 5px 11px;
+    border-radius: 8px;
+    padding: 6px 13px;
     font-size: 11px;
 }
 
@@ -729,11 +1068,11 @@ QPushButton#ghost:hover {
 }
 
 QLineEdit, QTextEdit, QListWidget {
-    background: %(deep)s;
+    background: %(deep_glass)s;
     color: %(text)s;
-    border: 1px solid %(border)s;
-    border-radius: 6px;
-    padding: 5px;
+    border: 1px solid %(hairline)s;
+    border-radius: 8px;
+    padding: 6px;
     selection-background-color: %(mint)s;
     selection-color: %(on_accent)s;
 }
@@ -831,6 +1170,10 @@ def build_stylesheet():
         "button_border": theme.button_border,
         "accent_soft": theme.accent_soft,
         "accent_faint": theme.accent_faint,
+        "win_glass": theme.window_glass,
+        "header_glass": theme.header_glass,
+        "deep_glass": theme.deep_glass,
+        "hairline": theme.hairline,
     }
 
 
@@ -1274,32 +1617,547 @@ class BootScreen(QWidget):
 
 
 # ==========================================================
+# HUD BOOT SCREEN  (holographic heads-up-display boot sequence)
+# ==========================================================
+
+HUD_CYAN = "#5ad8ff"
+HUD_AMBER = "#ffb347"
+
+
+def _clamp(value):
+    return max(0.0, min(1.0, value))
+
+
+def _hud(alpha=255, colour=HUD_CYAN):
+    tint = QColor(colour)
+    tint.setAlpha(int(max(0, min(255, alpha))))
+    return tint
+
+
+class HudBootScreen(QWidget):
+    """Holographic boot: power-on line, assembling reactor rings, live
+    diagnostics, telemetry, decrypting welcome, then rings burst outward
+    while the screen fades into the desktop. Any key or click skips."""
+
+    DURATION = 6.2          # seconds before the exit begins
+    EXIT = 0.9              # length of the fade into the desktop
+
+    def __init__(self, on_finished):
+        super().__init__()
+        self.on_finished = on_finished
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setCursor(Qt.BlankCursor)
+
+        self.start = time.monotonic()
+        self.exit_at = None
+        self._backdrop = None
+        self.user = (os.environ.get("USERNAME") or os.environ.get("USER")
+                     or "bankser").upper()
+        self.log = self._diagnostics()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(16)
+
+    # ------------------------------------------------------
+    # TIMELINE
+    # ------------------------------------------------------
+
+    @staticmethod
+    def _diagnostics():
+        """Boot log lines - real numbers from this machine where we can."""
+        memory = _human(psutil.virtual_memory().total) if psutil else "online"
+        return [
+            ("Power-on self test", "OK"),
+            (f"Processor array // {os.cpu_count() or 1} threads", "ONLINE"),
+            (f"Memory banks // {memory}", "OK"),
+            (f"Host node // {platform.node() or 'local'}", "LINKED"),
+            (f"Python runtime // {platform.python_version()}", "OK"),
+            ("Holographic display calibration", "OK"),
+            ("Filecore storage mount", "OK"),
+            ("bsh command shell", "READY"),
+            ("bankserAI cognitive core", "STANDBY"),
+            ("Security perimeter", "ARMED"),
+            ("Desktop interface", "ONLINE"),
+        ]
+
+    def elapsed(self):
+        return time.monotonic() - self.start
+
+    def _tick(self):
+        if self.exit_at is None and self.elapsed() >= self.DURATION:
+            self.begin_exit()
+        self.update()
+
+    def begin_exit(self):
+        """Show the desktop underneath and fade this screen away."""
+        if self.exit_at is not None:
+            return
+        self.exit_at = self.elapsed()
+        self.on_finished()
+        self.raise_()
+        self.activateWindow()
+        fade = QPropertyAnimation(self, b"windowOpacity", self)
+        fade.setDuration(int(self.EXIT * 1000))
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.InCubic)
+        fade.finished.connect(self.close)
+        fade.start()
+
+    def keyPressEvent(self, event):
+        self.begin_exit()
+
+    def mousePressEvent(self, event):
+        self.begin_exit()
+
+    # ------------------------------------------------------
+    # PAINTING
+    # ------------------------------------------------------
+
+    def backdrop(self):
+        """Static layer (grid, glow, scanlines, vignette), drawn once."""
+        if self._backdrop is not None and self._backdrop.size() == self.size():
+            return self._backdrop
+        w, h = self.width(), self.height()
+        pixmap = QPixmap(self.size())
+        pixmap.fill(QColor("#02070b"))
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        p.setPen(QPen(_hud(13), 1))
+        for x in range(0, w, 40):
+            p.drawLine(x, 0, x, h)
+        for y in range(0, h, 40):
+            p.drawLine(0, y, w, y)
+
+        glow = QRadialGradient(w / 2, h * 0.46, max(w, h) * 0.45)
+        glow.setColorAt(0, _hud(46))
+        glow.setColorAt(1, _hud(0))
+        p.fillRect(pixmap.rect(), glow)
+
+        p.setPen(QPen(QColor(0, 0, 0, 55), 1))
+        for y in range(0, h, 3):
+            p.drawLine(0, y, w, y)
+
+        vignette = QRadialGradient(w / 2, h / 2, max(w, h) * 0.72)
+        vignette.setColorAt(0.55, QColor(0, 0, 0, 0))
+        vignette.setColorAt(1.0, QColor(0, 0, 0, 200))
+        p.fillRect(pixmap.rect(), vignette)
+        p.end()
+
+        self._backdrop = pixmap
+        return pixmap
+
+    def paintEvent(self, event):
+        t = self.elapsed()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.drawPixmap(0, 0, self.backdrop())
+
+        if t < 0.6:
+            self._power_on(p, t, w, h)
+
+        reveal = _clamp((t - 0.35) / 0.5)
+        if reveal <= 0:
+            return
+        # a few early flickers, like a projector warming up
+        flicker = 0.45 if t < 1.1 and int(t * 23) % 5 == 0 else 1.0
+        p.setOpacity(reveal * flicker)
+
+        burst = _clamp((t - self.exit_at) / self.EXIT) if self.exit_at else 0
+        progress = 1.0 if self.exit_at else _clamp((t - 0.8) / (self.DURATION - 1.8))
+        radius = min(w, h) * 0.2 * (1 + 0.8 * burst)
+        cx, cy = w / 2, h * 0.46
+
+        self._reactor(p, t, cx, cy, radius, progress)
+        self._diagnostics_panel(p, t, w, h)
+        self._telemetry_panel(p, t, w, h)
+        self._frame(p, t, w, h, progress)
+        self._scan_band(p, t, w, h)
+        self._welcome(p, t, w, cy + min(w, h) * 0.26)
+
+    def _power_on(self, p, t, w, h):
+        """A CRT-style line that snaps open from the centre."""
+        width = w * _clamp(t / 0.3)
+        height = 2 + h * 0.5 * _clamp((t - 0.3) / 0.3)
+        band = QLinearGradient(w / 2 - width / 2, 0, w / 2 + width / 2, 0)
+        band.setColorAt(0, _hud(0))
+        band.setColorAt(0.5, QColor(225, 250, 255, 230))
+        band.setColorAt(1, _hud(0))
+        alpha = 1 - _clamp((t - 0.35) / 0.25)
+        p.setOpacity(alpha)
+        p.fillRect(QRectF(w / 2 - width / 2, h / 2 - height / 2,
+                          width, height), band)
+        p.setOpacity(1)
+
+    def _reactor(self, p, t, cx, cy, R, progress):
+        p.save()
+        p.translate(cx, cy)
+
+        def grow(i):        # each ring assembles a little after the last
+            return _clamp((t - 0.5 - 0.22 * i) / 0.8)
+
+        # pulsing core
+        pulse = 0.75 + 0.25 * math.sin(t * 4)
+        core = QRadialGradient(0, 0, R * 0.55)
+        core.setColorAt(0, _hud(150 * pulse))
+        core.setColorAt(0.6, _hud(40 * pulse))
+        core.setColorAt(1, _hud(0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(core)
+        p.drawEllipse(QPointF(0, 0), R * 0.55, R * 0.55)
+
+        # 1. outer segmented ring, slow clockwise
+        k = grow(0)
+        if k:
+            pen = QPen(_hud(190), R * 0.055)
+            pen.setCapStyle(Qt.FlatCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            rect = QRectF(-R, -R, R * 2, R * 2)
+            for segment in range(12):
+                start = -t * 12 + segment * 30
+                p.drawArc(rect, int(start * 16), int(22 * k * 16))
+            p.setPen(QPen(_hud(70), 1))
+            p.drawEllipse(QPointF(0, 0), R * 1.08, R * 1.08)
+
+        # 2. tick ring, counter-clockwise
+        k = grow(1)
+        if k:
+            p.save()
+            p.rotate(t * 20)
+            for i in range(int(72 * k)):
+                major = i % 6 == 0
+                p.setPen(QPen(_hud(230 if major else 110), 2 if major else 1))
+                angle = math.radians(i * 5)
+                inner, outer = R * 0.80, R * (0.89 if major else 0.85)
+                p.drawLine(QPointF(math.cos(angle) * inner,
+                                   math.sin(angle) * inner),
+                           QPointF(math.cos(angle) * outer,
+                                   math.sin(angle) * outer))
+            p.restore()
+
+        # 3. radar sweep + three fast arcs
+        k = grow(2)
+        if k:
+            sweep = QConicalGradient(0, 0, (t * 140) % 360)
+            sweep.setColorAt(0, _hud(110 * k))
+            sweep.setColorAt(0.14, _hud(0))
+            sweep.setColorAt(1, _hud(0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(sweep)
+            p.drawEllipse(QPointF(0, 0), R * 0.66, R * 0.66)
+
+            pen = QPen(_hud(235), 3)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            rect = QRectF(-R * 0.72, -R * 0.72, R * 1.44, R * 1.44)
+            for arc in range(3):
+                start = t * 95 + arc * 120
+                p.drawArc(rect, int(start * 16), int(70 * k * 16))
+
+        # 4. progress ring
+        k = grow(3)
+        if k:
+            rect = QRectF(-R * 0.5, -R * 0.5, R, R)
+            p.setPen(QPen(_hud(45), 6))
+            p.drawEllipse(rect)
+            pen = QPen(_hud(255), 6)
+            pen.setCapStyle(Qt.FlatCap)
+            p.setPen(pen)
+            p.drawArc(rect, 90 * 16, -int(360 * progress * k * 16))
+
+            p.save()
+            p.rotate(-t * 35)
+            dashed = QPen(_hud(120), 1, Qt.DashLine)
+            p.setPen(dashed)
+            p.drawEllipse(QPointF(0, 0), R * 0.41, R * 0.41)
+            p.restore()
+
+            number = QFont(UI_FONT_NAME)
+            number.setPixelSize(max(12, int(R * 0.2)))
+            number.setBold(True)
+            p.setFont(number)
+            p.setPen(_hud(255))
+            p.drawText(QRectF(-R * 0.4, -R * 0.2, R * 0.8, R * 0.28),
+                       Qt.AlignCenter, f"{int(progress * 100)}%")
+            label = QFont(UI_FONT_NAME)
+            label.setPixelSize(max(8, int(R * 0.055)))
+            label.setLetterSpacing(QFont.AbsoluteSpacing, 2)
+            p.setFont(label)
+            p.setPen(_hud(170))
+            p.drawText(QRectF(-R * 0.4, R * 0.08, R * 0.8, R * 0.12),
+                       Qt.AlignCenter, "SYSTEM INTEGRITY")
+
+        p.restore()
+
+    def _heading(self, p, x, y, width, text):
+        font = QFont(UI_FONT_NAME)
+        font.setPixelSize(12)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 3)
+        p.setFont(font)
+        p.setPen(_hud(230))
+        p.drawText(QPointF(x, y), text)
+        p.setPen(QPen(_hud(120), 1))
+        p.drawLine(QPointF(x, y + 8), QPointF(x + width, y + 8))
+        p.setPen(QPen(_hud(255), 3))
+        p.drawLine(QPointF(x, y + 8), QPointF(x + 40, y + 8))
+
+    def _diagnostics_panel(self, p, t, w, h):
+        x, y, width = w * 0.05, h * 0.2, w * 0.27
+        self._heading(p, x, y, width, "BOOT DIAGNOSTICS")
+        font = QFont(MONO_FONT_NAME)
+        font.setPixelSize(13)
+        p.setFont(font)
+        metrics = QFontMetricsF(font)
+
+        for row, (label, status) in enumerate(self.log):
+            appear = 1.0 + row * 0.36
+            if t < appear:
+                break
+            typed = _clamp((t - appear) / 0.28)
+            line_y = y + 36 + row * 24
+            shown = label[:int(len(label) * typed)]
+            p.setPen(_hud(200))
+            p.drawText(QPointF(x, line_y), "› " + shown)
+            if typed < 1:
+                continue
+            warm = status in ("STANDBY", "ARMED")
+            tag = f"[{status}]"
+            tag_x = x + width - metrics.horizontalAdvance(tag)
+            dots_from = x + metrics.horizontalAdvance("› " + label) + 6
+            p.setPen(_hud(60))
+            dots = "." * max(0, int((tag_x - dots_from - 6)
+                                    / max(1, metrics.horizontalAdvance("."))))
+            p.drawText(QPointF(dots_from, line_y), dots)
+            p.setPen(_hud(255, HUD_AMBER if warm else "#9dfcff"))
+            p.drawText(QPointF(tag_x, line_y), tag)
+
+    def _telemetry_panel(self, p, t, w, h):
+        x, y, width = w * 0.68, h * 0.2, w * 0.27
+        self._heading(p, x, y, width, "TELEMETRY")
+
+        font = QFont(MONO_FONT_NAME)
+        font.setPixelSize(12)
+        p.setFont(font)
+        show = _clamp((t - 0.9) / 0.6)
+        for i, name in enumerate(("CPU", "MEM", "NET", "PWR", "I/O", "THM")):
+            bar_y = y + 30 + i * 24
+            level = 0.55 + 0.35 * math.sin(t * (1.3 + i * 0.37) + i * 1.7)
+            level *= show
+            p.setPen(_hud(200))
+            p.drawText(QPointF(x, bar_y + 10), name)
+            track = QRectF(x + 44, bar_y, width - 96, 10)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_hud(35))
+            p.drawRect(track)
+            p.setBrush(_hud(220, HUD_AMBER if level > 0.85 else HUD_CYAN))
+            p.drawRect(QRectF(track.x(), track.y(),
+                              track.width() * level, track.height()))
+            p.setPen(_hud(170))
+            p.drawText(QPointF(x + width - 44, bar_y + 10),
+                       f"{int(level * 100):3d}%")
+
+        # voice-style waveform
+        box = QRectF(x, y + 186, width, 70)
+        p.setPen(QPen(_hud(70), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(box)
+        wave = QPainterPath()
+        steps = 90
+        for i in range(steps + 1):
+            fx = i / steps
+            envelope = math.sin(math.pi * fx)
+            value = (math.sin(fx * 23 + t * 9) * 0.5
+                     + math.sin(fx * 51 - t * 13) * 0.3
+                     + math.sin(fx * 7 + t * 3) * 0.2)
+            point = QPointF(box.x() + fx * box.width(),
+                            box.center().y()
+                            + value * envelope * box.height() * 0.42 * show)
+            wave.moveTo(point) if i == 0 else wave.lineTo(point)
+        p.setPen(QPen(_hud(240), 1.6))
+        p.drawPath(wave)
+
+        # scrolling hex stream
+        p.setPen(_hud(110))
+        tick = int(t * 12)
+        for row in range(6):
+            rng = random.Random(tick * 31 + row)
+            line = " ".join(f"{rng.randrange(256):02X}" for _ in range(8))
+            p.drawText(QPointF(x, y + 285 + row * 18), line)
+
+    def _frame(self, p, t, w, h, progress):
+        margin, arm = 28, 70
+        p.setPen(QPen(_hud(170), 2))
+        for sx, sy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            cx = w - margin if sx else margin
+            cy = h - margin if sy else margin
+            dx = -arm if sx else arm
+            dy = -arm if sy else arm
+            p.drawLine(QPointF(cx, cy), QPointF(cx + dx, cy))
+            p.drawLine(QPointF(cx, cy), QPointF(cx, cy + dy))
+
+        font = QFont(UI_FONT_NAME)
+        font.setPixelSize(12)
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 3)
+        p.setFont(font)
+        p.setPen(_hud(210))
+        p.drawText(QRectF(0, margin - 6, w, 20), Qt.AlignCenter,
+                   f"{APP_NAME} SYSTEMS  //  BOOT SEQUENCE  v{VERSION}")
+        p.drawText(QRectF(margin + 12, h - margin - 22, w / 2, 20),
+                   Qt.AlignLeft, f"OPERATOR: {self.user}")
+        p.drawText(QRectF(w / 2, h - margin - 22, w / 2 - margin - 12, 20),
+                   Qt.AlignRight, datetime.now().strftime("%d.%m.%Y  %H:%M:%S"))
+
+        # long progress line along the bottom
+        line_w = w * 0.4
+        left = (w - line_w) / 2
+        base = h - margin - 12
+        p.setPen(QPen(_hud(50), 2))
+        p.drawLine(QPointF(left, base), QPointF(left + line_w, base))
+        p.setPen(QPen(_hud(255), 2))
+        p.drawLine(QPointF(left, base), QPointF(left + line_w * progress, base))
+
+    def _scan_band(self, p, t, w, h):
+        y = (t * 0.45 % 1.0) * h
+        band = QLinearGradient(0, y - 60, 0, y + 6)
+        band.setColorAt(0, _hud(0))
+        band.setColorAt(0.9, _hud(26))
+        band.setColorAt(1, _hud(70))
+        p.fillRect(QRectF(0, y - 60, w, 66), band)
+
+    def _welcome(self, p, t, w, y):
+        start = self.DURATION - 1.5
+        if t < start:
+            return
+
+        def decrypt(text, begin):
+            """Random glyphs that lock into the real letters one by one."""
+            rng = random.Random(int(t * 30))
+            return "".join(
+                ch if ch == " " or t >= begin + 0.035 * i + 0.3
+                else rng.choice("ABCDEF0123456789#%&@$")
+                for i, ch in enumerate(text))
+
+        small = QFont(UI_FONT_NAME)
+        small.setPixelSize(13)
+        small.setLetterSpacing(QFont.AbsoluteSpacing, 5)
+        p.setFont(small)
+        p.setPen(_hud(220, HUD_AMBER))
+        p.drawText(QRectF(0, y, w, 22), Qt.AlignCenter,
+                   decrypt("ALL SYSTEMS ONLINE", start))
+
+        big = QFont(UI_FONT_NAME)
+        big.setPixelSize(30)
+        big.setBold(True)
+        big.setLetterSpacing(QFont.AbsoluteSpacing, 6)
+        p.setFont(big)
+        text = decrypt(f"WELCOME BACK, {self.user}", start + 0.25)
+        rect = QRectF(0, y + 26, w, 44)
+        p.setPen(_hud(55))
+        for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2)):    # soft glow
+            p.drawText(rect.translated(dx, dy), Qt.AlignCenter, text)
+        p.setPen(QColor("#e8fbff"))
+        p.drawText(rect, Qt.AlignCenter, text)
+
+
+# ==========================================================
 # MINT WINDOW  (panelled window with a Cinnamon title bar)
 # ==========================================================
+
+class TitleBar(QWidget):
+    """Window header you can grab to move the window.
+
+    App windows (bankserAI, ART, ...) move as whole top-level windows.
+    Desktop panels set `owner.on_drag_start`; it pulls the panel out of
+    the grid so it can float freely inside the desktop."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self._press = None              # where the button went down
+        self._offset = None             # set once the drag really starts
+        self.setCursor(Qt.OpenHandCursor)
+
+    def _target(self):
+        return self.owner if self.owner.on_drag_start else self.window()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        self._press = event.globalPosition().toPoint()
+        self._target().raise_()
+
+    def mouseMoveEvent(self, event):
+        if self._press is None:
+            return super().mouseMoveEvent(event)
+        now = event.globalPosition().toPoint()
+        if self._offset is None:
+            # a plain click must not pull a panel out of the grid
+            if (now - self._press).manhattanLength() < 5:
+                return
+            start = self.owner.on_drag_start
+            if start and not start(self.owner):
+                self._press = None      # e.g. the panel is maximized
+                return
+            self._offset = self._press - self._target().mapToGlobal(
+                QPoint(0, 0))
+            self.setCursor(Qt.ClosedHandCursor)
+        target = self._target()
+        top_left = now - self._offset
+        if target.isWindow():
+            target.move(top_left)
+            return
+        # keep at least the title bar inside the desktop
+        area = target.parentWidget().rect()
+        point = target.parentWidget().mapFromGlobal(top_left)
+        x = min(max(point.x(), 80 - target.width()), area.width() - 80)
+        y = min(max(point.y(), 0), area.height() - self.height())
+        target.move(x, y)
+
+    def mouseReleaseEvent(self, event):
+        self._press = self._offset = None
+        self.setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.owner._toggle_maximize()
+
 
 class MintWindow(QFrame):
     def __init__(self, title, icon_kind, on_close=None, on_maximize=None,
                  parent=None):
         super().__init__(parent)
         self.setObjectName("mintwindow")
+        self.on_drag_start = None       # set by the desktop for its panels
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        header = QWidget()
+        header = TitleBar(self)
         header.setObjectName("winheader")
-        header.setFixedHeight(32)
+        header.setAttribute(Qt.WA_StyledBackground)
+        header.setFixedHeight(36)
 
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(10, 0, 6, 0)
-        header_layout.setSpacing(7)
+        header_layout.setContentsMargins(12, 0, 6, 0)
+        header_layout.setSpacing(8)
 
         icon = IconWidget(icon_kind, 16, MINT_LIGHT, theme_bound=True)
         header_layout.addWidget(icon)
 
         label = QLabel(title)
         label.setObjectName("wintitle")
+        title_font = ui_font(9, bold=True)
+        title_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.6)
+        label.setFont(title_font)
         header_layout.addWidget(label)
         header_layout.addStretch(1)
 
@@ -1320,7 +2178,7 @@ class MintWindow(QFrame):
         self._on_maximize = on_maximize
 
         self.body = QVBoxLayout()
-        self.body.setContentsMargins(11, 10, 11, 11)
+        self.body.setContentsMargins(12, 11, 12, 12)
         self.body.setSpacing(8)
 
         outer.addWidget(header)
@@ -1329,9 +2187,9 @@ class MintWindow(QFrame):
         self._on_close = on_close
 
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(18)
-        shadow.setColor(QColor(0, 0, 0, 90))
-        shadow.setOffset(0, 2)
+        shadow.setBlurRadius(28)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        shadow.setOffset(0, 6)
         self.setGraphicsEffect(shadow)
 
     def _toggle_maximize(self):
@@ -1361,40 +2219,71 @@ class Gauge(QWidget):
         super().__init__(parent)
         self.title = title
         self.value = value
-        self.setMinimumSize(96, 118)
+        self.subtitle = ""
+        self.setMinimumSize(96, 130)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._anim = QPropertyAnimation(self, b"shown", self)
+        self._anim.setDuration(600)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _get_shown(self):
+        return float(self.value)
+
+    def _set_shown(self, value):
+        self.value = value
+        self.update()
+
+    shown = Property(float, _get_shown, _set_shown)
+
+    def set_value(self, value, subtitle=""):
+        """Glide the ring to a new percentage."""
+        self.subtitle = subtitle
+        self._anim.stop()
+        self._anim.setStartValue(float(self.value))
+        self._anim.setEndValue(float(value))
+        self._anim.start()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
         w, h = self.width(), self.height()
-        label_h = 20
+        label_h = 32
         size = min(w, h - label_h) - 16
         if size <= 10:
             return
 
         rect = QRectF((w - size) / 2.0, 6, size, size)
 
-        track = QPen(QColor(CURRENT_THEME.gauge_track), 9)
+        track = QPen(QColor(CURRENT_THEME.gauge_track), 8)
         track.setCapStyle(Qt.RoundCap)
         painter.setPen(track)
         painter.setBrush(Qt.NoBrush)
         painter.drawArc(rect, 0, 360 * 16)
 
-        value_pen = QPen(QColor(MINT), 9)
+        # ring turns warm when the value runs high
+        hot = QColor("#ff6b6b") if self.value > 85 else QColor(MINT_LIGHT)
+        ring = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        ring.setColorAt(0, hot)
+        ring.setColorAt(1, QColor(MINT_DARK))
+        value_pen = QPen(QBrush(ring), 8)
         value_pen.setCapStyle(Qt.RoundCap)
         painter.setPen(value_pen)
-        painter.drawArc(rect, 90 * 16, -int(self.value * 3.6) * 16)
+        painter.drawArc(rect, 90 * 16, -int(self.value * 3.6 * 16))
 
-        painter.setFont(ui_font(13, bold=True))
+        painter.setFont(ui_font(14, bold=True))
         painter.setPen(QColor(TEXT))
-        painter.drawText(rect, Qt.AlignCenter, f"{self.value}%")
+        painter.drawText(rect, Qt.AlignCenter, f"{round(self.value)}%")
 
         painter.setFont(ui_font(9, bold=True))
         painter.setPen(QColor(TEXT_DIM))
-        painter.drawText(QRectF(0, h - label_h, w, label_h),
+        painter.drawText(QRectF(0, h - label_h, w, 16),
                          Qt.AlignCenter, self.title)
+        if self.subtitle:
+            painter.setFont(ui_font(8))
+            painter.setPen(QColor(TEXT_MUTED))
+            painter.drawText(QRectF(0, h - 16, w, 16),
+                             Qt.AlignCenter, self.subtitle)
 
 
 # ==========================================================
@@ -1666,34 +2555,7 @@ class PasteShellWindow(QWidget):
         try:
             self.scan_queue.put("Starting IPSEA scan...")
 
-            output = self.run_command(["ipconfig"])
-            if output is None:
-                self.scan_queue.put("IPSEA ERROR: 'ipconfig' is not available "
-                                    "on this system.")
-                return
-
-            blocks = re.split(r"\r?\n\r?\n", output)
-            network = None
-
-            for block in blocks:
-                ip_match = re.search(
-                    r"IPv4 Address[^\n]*:\s*([\d.]+)", block)
-                mask_match = re.search(
-                    r"Subnet Mask[^\n]*:\s*([\d.]+)", block)
-
-                if ip_match and mask_match:
-                    local_ip = ip_match.group(1)
-                    subnet_mask = mask_match.group(1)
-
-                    try:
-                        candidate = ipaddress.ip_network(
-                            f"{local_ip}/{subnet_mask}", strict=False)
-                        if candidate.num_addresses <= 256:
-                            network = candidate
-                            break
-                    except ValueError:
-                        continue
-
+            network = self.find_local_network()
             if network is None:
                 self.scan_queue.put(
                     "Could not find a suitable local IPv4 network.")
@@ -1707,7 +2569,7 @@ class PasteShellWindow(QWidget):
                     subprocess.run(["ping", "-n", "1", "-w", "300", str(ip)],
                                    stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL,
-                                   timeout=2)
+                                   timeout=2, creationflags=NO_WINDOW)
                 except (subprocess.SubprocessError, OSError):
                     pass
 
@@ -1760,12 +2622,47 @@ class PasteShellWindow(QWidget):
         finally:
             self.scan_queue.put("__SCAN_FINISHED__")
 
+    def find_local_network(self):
+        """The IPv4 network of the adapter that holds the default route.
+
+        Works on any Windows language: the local IP comes from the routing
+        table (a UDP 'connect' sends no packets), and the mask is simply the
+        first 255.x.x.x address printed after that IP in ipconfig."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("192.0.2.1", 9))     # TEST-NET, never sent
+                local_ip = probe.getsockname()[0]
+        except OSError:
+            return None
+        if local_ip.startswith(("0.", "127.")):
+            return None
+
+        mask = "255.255.255.0"
+        output = self.run_command(["ipconfig"]) or ""
+        at = output.find(local_ip)
+        if at >= 0:
+            found = re.search(r"\b(255\.\d{1,3}\.\d{1,3}\.\d{1,3})\b",
+                              output[at + len(local_ip):])
+            if found:
+                mask = found.group(1)
+
+        try:
+            network = ipaddress.ip_network(f"{local_ip}/{mask}", strict=False)
+        except ValueError:
+            return None
+        if network.num_addresses > 1024:
+            # a /16 would mean 65k pings; scan the /24 around us instead
+            self.scan_queue.put(f"{network} is large - scanning the /24 "
+                                "around this computer only.")
+            network = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        return network
+
     @staticmethod
     def run_command(command):
         """Run a system command and return its text output (or None)."""
         try:
             result = subprocess.run(command, capture_output=True,
-                                    timeout=20)
+                                    timeout=20, creationflags=NO_WINDOW)
             if result.returncode != 0 and not result.stdout:
                 return None
             return result.stdout.decode("utf-8", errors="ignore")
@@ -1777,13 +2674,37 @@ class PasteShellWindow(QWidget):
     # ------------------------------------------------------
 
     def scan_weak_wifi(self):
+        """Start the Wi-Fi scan on a worker (netsh can take ~20 s)."""
+        if self.scan_running:
+            self.console_print("A scan is already running!")
+            return
+        self.scan_running = True
         self.console_print("\n[ WEAKWIFI ] Scanning nearby Wi-Fi...")
+        threading.Thread(target=self.wifi_worker, daemon=True).start()
 
-        output = self.run_command(
-            ["netsh", "wlan", "show", "networks", "mode=bssid"])
+    def wifi_worker(self):
+        try:
+            self._wifi_scan(self.scan_queue.put)
+        except Exception as error:
+            self.scan_queue.put(f"Wi-Fi scan error: {error}")
+        finally:
+            self.scan_queue.put("__SCAN_FINISHED__")
 
-        if output is None:
-            self.console_print("Wi-Fi scan failed. Check your Wi-Fi adapter.")
+    @staticmethod
+    def _wifi_scan(say):
+        try:
+            result = subprocess.run(
+                ["netsh", "wlan", "show", "networks", "mode=bssid"],
+                capture_output=True, timeout=20, creationflags=NO_WINDOW)
+        except (OSError, subprocess.SubprocessError):
+            say("Wi-Fi scan failed: 'netsh' is not available here.")
+            return
+
+        output = result.stdout.decode("utf-8", errors="ignore")
+        if result.returncode != 0:
+            # e.g. Windows 11 needs Location turned on - netsh says so
+            say("Wi-Fi scan failed:")
+            say(output.strip() or "Check your Wi-Fi adapter.")
             return
 
         networks = {}
@@ -1791,7 +2712,8 @@ class PasteShellWindow(QWidget):
 
         for line in output.splitlines():
             ssid_match = re.match(r"\s*SSID \d+ :\s*(.*)", line)
-            signal_match = re.match(r"\s*Signal\s*:\s*(\d+)%", line)
+            # only signal lines end in '%', whatever the Windows language
+            signal_match = re.match(r"[^:]*:\s*(\d+)\s*%\s*$", line)
 
             if ssid_match:
                 current_ssid = ssid_match.group(1).strip()
@@ -1809,25 +2731,27 @@ class PasteShellWindow(QWidget):
 
         results.sort(key=lambda x: x[1])
 
-        self.console_print("=" * 45)
-        self.console_print(" NETWORK NAME          SIGNAL")
-        self.console_print("=" * 45)
+        say("=" * 45)
+        say(" NETWORK NAME          SIGNAL")
+        say("=" * 45)
 
         for name, signal in results:
-            self.console_print(f"{name[:22]:<24} {signal:.0f}%")
+            say(f"{name[:22]:<24} {signal:.0f}%")
 
             if signal < 30:
-                self.console_print("  STATUS: VERY WEAK")
+                say("  STATUS: VERY WEAK")
             elif signal < 60:
-                self.console_print("  STATUS: WEAK")
+                say("  STATUS: WEAK")
             elif signal < 80:
-                self.console_print("  STATUS: GOOD")
+                say("  STATUS: GOOD")
             else:
-                self.console_print("  STATUS: STRONG")
+                say("  STATUS: STRONG")
 
-            self.console_print("-" * 45)
+            say("-" * 45)
 
-        self.console_print(f"\nFound {len(results)} Wi-Fi networks.")
+        say(f"\nFound {len(results)} Wi-Fi networks.")
+        if not results:
+            say("Is Wi-Fi switched on?")
 
     # ------------------------------------------------------
     # QUEUE DRAIN
@@ -2010,6 +2934,10 @@ AI_KNOWLEDGE = {
 }
 
 
+MAX_DIGITS = 4000                  # under Python's 4300-digit str() limit
+MAX_BITS = int(MAX_DIGITS * 3.33)
+
+
 def _safe_math(expression):
     """Evaluate arithmetic without using eval()."""
     import ast
@@ -2033,7 +2961,15 @@ def _safe_math(expression):
             operation = operations.get(type(node.op))
             if operation is None:
                 raise ValueError("unsupported operator")
-            return operation(left, right)
+            # huge integers freeze the whole app (CPython holds the GIL
+            # during one big multiplication), so refuse them up front
+            if (isinstance(node.op, ast.Pow) and abs(left) > 1 and right > 0
+                    and right * math.log10(abs(left)) > MAX_DIGITS):
+                raise ValueError("result too large")
+            result = operation(left, right)
+            if isinstance(result, int) and result.bit_length() > MAX_BITS:
+                raise ValueError("result too large")
+            return result
         if isinstance(node, ast.UnaryOp):
             value = evaluate(node.operand)
             if isinstance(node.op, ast.USub):
@@ -2076,6 +3012,7 @@ class LocalModel:
         self.port = AI_SERVER_PORT
         self.state = "idle"        # idle / starting / ready / failed
         self.error = ""
+        self.shutting_down = False  # set by stop(); halts any startup
         self.model_path = self._find_model()
         self.server_path = self._find_server()
         self.backend = self._detect_backend()
@@ -2177,8 +3114,10 @@ class LocalModel:
         except Exception:
             return False
 
+        # only our own '--alias qwen'; a generic id like 'local' could be a
+        # server the user runs themselves
         for entry in body.get("data") or []:
-            if entry.get("id") in ("qwen", "local"):
+            if entry.get("id") == "qwen":
                 return True
         return False
 
@@ -2224,36 +3163,73 @@ class LocalModel:
 
         for attempt in range(4):
             self.port = AI_SERVER_PORT + attempt
+            port_was_free = self._port_free(self.port)
 
             try:
                 process = subprocess.Popen(
                     self._command(),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=(subprocess.CREATE_NO_WINDOW
-                                   if os.name == "nt" else 0),
+                    creationflags=NO_WINDOW,
                 )
             except OSError as error:
                 self.state = "failed"
                 self.error = str(error)
                 return False
 
+            # record it right away: if the desktop quits during the wait
+            # below, stop() must still find and kill it
+            self.process = process
+            self.pid = process.pid
+            self._write_pid(process.pid)
+            if self.shutting_down:
+                self.stop()
+                return False
+
             time.sleep(2.5)
 
             if process.poll() is None:
-                self.process = process
-                self.pid = process.pid
-                self._write_pid(process.pid)
                 return True
 
-            # it died straight away, so the port is probably taken
-            try:
-                process.kill()
-            except Exception:
-                pass
+            self.process = self.pid = None
+            if port_was_free:
+                # nothing else had the port - the server itself is broken
+                self.state = "failed"
+                self.error = ("llama-server exited on startup - check the "
+                              "model file and runtime in ~/.bankser")
+                return False
+            # the port was taken; try the next one
 
         self.state = "failed"
         self.error = "could not start llama-server (every port is busy)"
+        return False
+
+    @staticmethod
+    def _port_free(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((AI_SERVER_HOST, port))
+                return True
+            except OSError:
+                return False
+
+    @staticmethod
+    def _is_llama_server(pid):
+        """Only ever kill a process that really is llama-server."""
+        if not pid:
+            return False
+        try:
+            if psutil is not None:
+                return psutil.Process(pid).name().lower().startswith(
+                    "llama-server")
+            if os.name == "nt":
+                listing = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=NO_WINDOW).stdout.lower()
+                return "llama-server" in listing
+        except Exception:
+            return False
         return False
 
     def ensure_ready(self, timeout=600):
@@ -2262,10 +3238,17 @@ class LocalModel:
             if self.state == "ready" and self._alive():
                 return True
 
-            # adopt a server that is already running this model
+            if self.shutting_down:
+                return False
+
+            # adopt a server that is already running this model (usually an
+            # orphan from a crashed session); remember its PID only once it
+            # is confirmed to be llama-server, so stop() never kills anything
+            # else
             if self.process is None and self._serving_our_model():
                 self.state = "ready"
-                self.pid = self._read_pid() or self._pid_on_port(self.port)
+                pid = self._read_pid() or self._pid_on_port(self.port)
+                self.pid = pid if self._is_llama_server(pid) else None
                 return True
 
             if not self.available():
@@ -2279,11 +3262,15 @@ class LocalModel:
 
             deadline = time.time() + timeout
             while time.time() < deadline:
+                process = self.process          # stop() may clear it
+                if self.shutting_down or process is None:
+                    return False
+
                 if self._alive():
                     self.state = "ready"
                     return True
 
-                if self.process.poll() is not None:
+                if process.poll() is not None:
                     self.state = "failed"
                     self.error = "llama-server exited while loading"
                     return False
@@ -2333,6 +3320,7 @@ class LocalModel:
 
     def stop(self):
         """Shut the server down and free its memory."""
+        self.shutting_down = True      # a startup in progress gives up
         process = self.process
         pid = self.pid
         self.process = None
@@ -2352,8 +3340,11 @@ class LocalModel:
                 process.kill()
             return
 
-        # an adopted server has to be killed by its process id
-        if pid and os.name == "nt":
+        # an adopted server has to be killed by its process id - re-check
+        # the name in case Windows reused the PID for something else
+        if not self._is_llama_server(pid):
+            return
+        if os.name == "nt":
             try:
                 subprocess.run(["taskkill", "/PID", str(pid), "/F"],
                                capture_output=True, timeout=20)
@@ -2473,8 +3464,13 @@ class AIEngine:
 
                 return None
 
+        # a site name only counts right after an "open" style verb, or on
+        # its own - "explain how a bank works" must not open a bank site
+        bare = self._clean_site(lowered)
         for name, url in AI_SITES.items():
-            if re.search(rf"\b{re.escape(name)}\b", lowered):
+            if bare == name or re.search(
+                    rf"\b(open|go to|visit|launch|load|browse)\s+(the\s+)?"
+                    rf"{re.escape(name)}\b", lowered):
                 return url
 
         return None
@@ -2501,12 +3497,16 @@ class AIEngine:
                 query = match.group(1).strip()
                 if query in AI_SITES:
                     return AI_SITES[query]
-                return base + query.replace(" ", "+")
+                return base + quote_plus(query)
 
-        if "search" in lowered and "for" in lowered:
-            query = lowered.split("for", 1)[1].strip()
+        # "can you search the web for X" - whole words only, so 'research'
+        # or 'format' never trigger it
+        match = re.search(r"\bsearch(?:\s+(?:the\s+web|online|google))?"
+                          r"\s+for\s+(.+)$", lowered)
+        if match:
+            query = match.group(1).strip(" ?!.")
             if query:
-                return "https://www.google.com/search?q=" + query.replace(" ", "+")
+                return "https://www.google.com/search?q=" + quote_plus(query)
 
         return None
 
@@ -2677,17 +3677,22 @@ class AIEngine:
         if not lowered:
             return None
 
-        has_verb = bool(self.AI_VERBS.search(lowered))
         bare = lowered.strip(" .!?:")
 
         for app, aliases in self.AI_APP_ALIASES.items():
             for alias in aliases:
-                if not self._alias_hit(lowered, alias):
-                    continue
-                if has_verb or bare == alias:
+                if bare == alias or self._verb_then_alias(lowered, alias):
                     return app
 
         return None
+
+    def _verb_then_alias(self, lowered, alias):
+        """'open the matrix rain' yes; 'run python in a terminal' no -
+        the app name must follow the verb within two words."""
+        name = re.escape(alias).replace(r"\ ", r"\s+")
+        pattern = (self.AI_VERBS.pattern + r"\s+(?:\S+\s+){0,2}?"
+                   + name + r"\b")
+        return bool(re.search(pattern, lowered))
 
     def find_app_mention(self, text):
         """Find an app that a reply names, without needing a verb."""
@@ -2874,6 +3879,7 @@ class BankserAIWindow(QWidget):
     def __init__(self, parent=None, on_closed=None, launcher=None):
         super().__init__(parent, Qt.Window)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)   # free it, don't just hide
         self.setWindowTitle("bankserAI")
         self.setFixedSize(760, 640)
         self._on_closed = on_closed
@@ -2931,7 +3937,7 @@ class BankserAIWindow(QWidget):
         hints = QLabel(
             "Try: 'what is 24 * 7' - 'open the matrix rain' - "
             "'open youtube' - 'search for linux mint' - "
-            "'explain how a bank calculates interest'")
+            "'explain how compound interest works'")
         hints.setFont(mono_font(9))
         hints.setObjectName("muted")
         hints.setWordWrap(True)
@@ -3050,7 +4056,10 @@ class BankserAIWindow(QWidget):
                     else:
                         self.say(f"I could not open {launch}.", "ai")
 
-                if url:
+                if url and not re.match(r"https?://", url, re.IGNORECASE):
+                    # a model answer must never open local files/programs
+                    self.say(f"Blocked a non-web link: {url}", "ai")
+                elif url:
                     self.say(f"↗ opening {url}", "ai")
                     try:
                         webbrowser.open(url)
@@ -3067,6 +4076,8 @@ class BankserAIWindow(QWidget):
         self.say("Conversation cleared.", "ai")
 
     def closeEvent(self, event):
+        # stop acting on answers that arrive after the window is gone
+        self.drain_timer.stop()
         if self._on_closed:
             self._on_closed()
         super().closeEvent(event)
@@ -3096,6 +4107,7 @@ class ArtCanvas(QWidget):
 
         self.undo_stack = []
         self.redo_stack = []
+        self.dirty = False             # unsaved changes?
 
         self.tool = "pencil"
         self.color = QColor("#1b2019")
@@ -3115,6 +4127,7 @@ class ArtCanvas(QWidget):
         self.color = QColor(colour)
 
     def push_undo(self):
+        self.dirty = True              # every edit pushes undo first
         self.undo_stack.append(self.image.copy())
         if len(self.undo_stack) > 40:
             self.undo_stack.pop(0)
@@ -3277,34 +4290,53 @@ class ArtCanvas(QWidget):
                 and 0 <= point.y() < self.image.height()):
             return
 
-        target = self.image.pixelColor(point)
-        replacement = self.color
+        # scanline fill over the raw 32-bit pixels: fills whole row runs at
+        # once instead of one QPoint per pixel (which froze the UI for
+        # seconds and used hundreds of MB on a blank canvas)
+        # ponytail: still pure Python (~0.5 s for a full 1000x700 fill);
+        # use numpy/scipy if huge photos need instant fills
+        if self.image.format() != QImage.Format_ARGB32:
+            self.image = self.image.convertToFormat(QImage.Format_ARGB32)
+        width, height = self.image.width(), self.image.height()
+        pixels = array.array("I")
+        pixels.frombytes(bytes(self.image.constBits())[:width * height * 4])
 
+        target = pixels[point.y() * width + point.x()]
+        replacement = self.color.rgba() & 0xFFFFFFFF
         if target == replacement:
             return
 
-        width, height = self.image.width(), self.image.height()
-        stack = [point]
-        visited = set()
-
+        stack = [(point.x(), point.y())]
         while stack:
-            current = stack.pop()
-            x, y = current.x(), current.y()
-
-            if (x, y) in visited:
+            x, y = stack.pop()
+            row = y * width
+            if pixels[row + x] != target:
                 continue
-            visited.add((x, y))
+            left = x
+            while left > 0 and pixels[row + left - 1] == target:
+                left -= 1
+            right = x
+            while right < width - 1 and pixels[row + right + 1] == target:
+                right += 1
+            pixels[row + left:row + right + 1] = \
+                array.array("I", [replacement]) * (right - left + 1)
 
-            if self.image.pixelColor(current) != target:
-                continue
+            # seed one point per run of target pixels above and below
+            for ny in (y - 1, y + 1):
+                if not 0 <= ny < height:
+                    continue
+                above = ny * width
+                in_run = False
+                for nx in range(left, right + 1):
+                    if pixels[above + nx] == target:
+                        if not in_run:
+                            stack.append((nx, ny))
+                            in_run = True
+                    else:
+                        in_run = False
 
-            self.image.setPixelColor(current, replacement)
-
-            for neighbour in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                nx, ny = neighbour
-                if 0 <= nx < width and 0 <= ny < height:
-                    stack.append(QPoint(nx, ny))
-
+        self.image = QImage(pixels.tobytes(), width, height, width * 4,
+                            QImage.Format_ARGB32).copy()
         self.update()
 
     # ------------------------------------------------------
@@ -3320,6 +4352,7 @@ class ArtCanvas(QWidget):
             return False
         self.push_undo()
         self.image = loaded.convertToFormat(QImage.Format_ARGB32)
+        self.dirty = False
         self.update()
         return True
 
@@ -3341,6 +4374,7 @@ class ArtStudioWindow(QWidget):
     def __init__(self, parent=None, on_closed=None):
         super().__init__(parent, Qt.Window)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)   # frees the undo history
         self.setWindowTitle("ART Studio")
         self.setFixedSize(1020, 700)
         self._on_closed = on_closed
@@ -3532,9 +4566,11 @@ class ArtStudioWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save drawing", str(HOME / "drawing.png"),
             "PNG image (*.png)")
-        if path:
-            if self.canvas.save(path):
-                self.file_label.setText(Path(path).name)
+        if path and self.canvas.save(path):
+            self.file_label.setText(Path(path).name)
+            self.canvas.dirty = False
+            return True
+        return False
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -3543,7 +4579,10 @@ class ArtStudioWindow(QWidget):
                      Qt.Key_R: "rect", Qt.Key_O: "ellipse",
                      Qt.Key_F: "fill", Qt.Key_I: "picker"}
 
-        if key in shortcuts:
+        # plain letters pick tools; Ctrl+O etc. fall through to the menu keys
+        no_modifier = not (event.modifiers() & (
+            Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
+        if key in shortcuts and no_modifier:
             self.select_tool(shortcuts[key])
             return
 
@@ -3559,6 +4598,15 @@ class ArtStudioWindow(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        if self.canvas.dirty:
+            answer = QMessageBox.question(
+                self, "ART Studio", "Save your drawing before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if answer == QMessageBox.Cancel or (
+                    answer == QMessageBox.Save and not self.save_image()):
+                event.ignore()
+                return
         if self._on_closed:
             self._on_closed()
         super().closeEvent(event)
@@ -3801,7 +4849,7 @@ class MatrixRain(QWidget):
     def keyPressEvent(self, event):
         key = event.text().lower()
 
-        if key in ("q", "escape"):
+        if key == "q" or event.key() == Qt.Key_Escape:
             window = self.window()
             window.close()
             return
@@ -3810,7 +4858,7 @@ class MatrixRain(QWidget):
             self.set_color(MATRIX_COLOR_KEYS[key])
             return
 
-        if key.isdigit():
+        if len(key) == 1 and key in "0123456789":   # not '²' and friends
             # cmatrix style: 0 sprints, 9 crawls
             delay = int(key)
             self.set_speed(max(0.25, 3.4 - delay * 0.35))
@@ -3831,6 +4879,7 @@ class MatrixWindow(QWidget):
     def __init__(self, parent=None, on_closed=None):
         super().__init__(parent, Qt.Window)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.setWindowTitle("MATRIX RAIN")
         self.setFixedSize(860, 620)
         self._on_closed = on_closed
@@ -3943,6 +4992,253 @@ class MatrixWindow(QWidget):
 # MAIN DESKTOP
 # ==========================================================
 
+TERMINAL_COMMANDS = (
+    "help", "color", "-welcome", "ai", "art", "matrix", "pasteshell",
+    "ipsea", "weakwifi", "neofetch", "calc", "ls", "cd", "pwd", "open",
+    "top", "uptime", "history", "echo", "notify", "boot", "whoami", "date",
+    "system", "files", "clear", "open-home", "website",
+)
+
+
+def _human(size):
+    """Bytes -> '1.4 MB'."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+
+
+def _is_dir(path):
+    """Path.is_dir() that treats 'access denied' as 'not a folder'."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _duration(seconds):
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    return (f"{days}d " if days else "") + f"{hours}h {minutes:02d}m"
+
+
+class HistoryLineEdit(QLineEdit):
+    """Terminal input: Up/Down walk the history, Tab completes commands."""
+
+    def __init__(self, completions=(), parent=None):
+        super().__init__(parent)
+        self.history = []
+        self.index = 0
+        self.completions = sorted(completions)
+
+    def remember(self, command):
+        if not self.history or self.history[-1] != command:
+            self.history.append(command)
+        self.index = len(self.history)
+
+    def event(self, event):
+        # Tab normally moves focus, so catch it before QWidget does
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Tab:
+            text = self.text()
+            matches = [c for c in self.completions if c.startswith(text)]
+            if len(matches) == 1:
+                self.setText(matches[0] + " ")
+            elif matches:
+                self.setText(os.path.commonprefix(matches))
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Up and self.history:
+            self.index = max(0, self.index - 1)
+            self.setText(self.history[self.index])
+            return
+        if event.key() == Qt.Key_Down and self.history:
+            self.index = min(len(self.history), self.index + 1)
+            self.setText(self.history[self.index]
+                         if self.index < len(self.history) else "")
+            return
+        super().keyPressEvent(event)
+
+
+class Launcher(QWidget):
+    """Full-desktop app launcher: search, app grid, theme swatches."""
+
+    COLUMNS = 5
+
+    def __init__(self, desktop):
+        super().__init__(desktop.wallpaper)
+        self.desktop = desktop
+        self.hide()
+
+        outer = QVBoxLayout(self)
+        outer.addStretch(1)
+        center = QHBoxLayout()
+        outer.addLayout(center)
+        outer.addStretch(2)
+
+        self.card = QFrame()
+        self.card.setObjectName("launchcard")
+        self.card.setFixedWidth(640)
+        center.addStretch(1)
+        center.addWidget(self.card)
+        center.addStretch(1)
+
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(60)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        shadow.setOffset(0, 12)
+        self.card.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self.card)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(14)
+
+        title = QLabel(f"{APP_NAME}  Applications")
+        title.setObjectName("launchtitle")
+        title.setFont(ui_font(15, bold=True))
+        layout.addWidget(title)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("launchsearch")
+        self.search.setFixedHeight(40)
+        self.search.setPlaceholderText(
+            "Search apps…   Enter opens · Esc closes")
+        self.search.textChanged.connect(self.filter)
+        self.search.returnPressed.connect(self.launch_first)
+        layout.addWidget(self.search)
+
+        self.grid = QGridLayout()
+        self.grid.setSpacing(8)
+        layout.addLayout(self.grid)
+
+        self.tiles = []
+        for kind, name, action, _running in desktop.apps:
+            tile = QToolButton(self.card)
+            tile.setObjectName("tile")
+            tile.setText(name)
+            tile.setIconSize(QSize(30, 30))
+            tile.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            tile.setFixedSize(110, 86)
+            tile.setCursor(Qt.PointingHandCursor)
+            tile.kind = kind
+            tile.clicked.connect(lambda _=False, a=action: self.run(a))
+            self.tiles.append((name, tile, action))
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        label = QLabel("THEME")
+        label.setObjectName("dim")
+        bottom.addWidget(label)
+
+        self.swatches = []
+        for theme in THEMES:
+            swatch = QPushButton()
+            swatch.setFixedSize(24, 24)
+            swatch.setToolTip(theme.name.title())
+            swatch.setCursor(Qt.PointingHandCursor)
+            swatch.clicked.connect(
+                lambda _=False, n=theme.index: self.pick_theme(n))
+            bottom.addWidget(swatch)
+            self.swatches.append((theme, swatch))
+
+        bottom.addStretch(1)
+        for text, action in (("About", desktop.show_about),
+                             ("Shut down", desktop.close)):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _=False, a=action: self.run(a))
+            bottom.addWidget(button)
+        layout.addLayout(bottom)
+
+        self.visible_tiles = []
+        self.filter("")
+
+    def restyle(self):
+        theme = CURRENT_THEME
+        self.setStyleSheet(f"""
+            QFrame#launchcard {{
+                background: {theme.header_glass};
+                border: 1px solid {_rgba(MINT, 120)};
+                border-radius: 18px;
+            }}
+            QLabel#launchtitle {{ color: {TEXT}; }}
+            QLineEdit#launchsearch {{
+                font-size: 14px;
+                padding: 4px 12px;
+                border-radius: 10px;
+            }}
+            QToolButton#tile {{
+                background: transparent;
+                color: {TEXT};
+                border: none;
+                border-radius: 12px;
+                padding: 6px;
+                font-size: 11px;
+            }}
+            QToolButton#tile:hover {{ background: {theme.accent_soft}; }}
+        """)
+        for _name, tile, _action in self.tiles:
+            tile.setIcon(icon_pixmap(tile.kind, 30, MINT_LIGHT))
+        for swatch_theme, swatch in self.swatches:
+            ring = TEXT if swatch_theme is CURRENT_THEME else "transparent"
+            swatch.setStyleSheet(f"""
+                QPushButton {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 {swatch_theme.accent_light},
+                        stop:1 {swatch_theme.accent_dark});
+                    border: 2px solid {ring};
+                    border-radius: 12px;
+                    padding: 0;
+                }}
+            """)
+
+    def filter(self, text):
+        while self.grid.count():
+            self.grid.takeAt(0)
+        needle = text.strip().lower()
+        self.visible_tiles = [t for t in self.tiles if needle in t[0].lower()]
+        for _name, tile, _action in self.tiles:
+            tile.hide()
+        for i, (_name, tile, _action) in enumerate(self.visible_tiles):
+            self.grid.addWidget(tile, i // self.COLUMNS, i % self.COLUMNS)
+            tile.show()
+
+    def launch_first(self):
+        if self.visible_tiles:
+            self.run(self.visible_tiles[0][2])
+
+    def run(self, action):
+        self.hide()
+        action()
+
+    def pick_theme(self, number):
+        self.desktop.set_theme(number)
+        self.restyle()
+
+    def open(self):
+        self.setGeometry(self.parentWidget().rect())
+        self.restyle()
+        self.search.clear()
+        self.show()
+        self.raise_()
+        self.search.setFocus()
+
+    def paintEvent(self, event):
+        QPainter(self).fillRect(self.rect(), QColor(0, 0, 0, 150))
+
+    def mousePressEvent(self, event):
+        if not self.card.geometry().contains(event.position().toPoint()):
+            self.hide()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+        else:
+            super().keyPressEvent(event)
+
+
 class BankserDesktop(QMainWindow):
 
     def __init__(self):
@@ -3961,6 +5257,33 @@ class BankserDesktop(QMainWindow):
         self.art_window = None
         self.matrix_window = None
         self.gauges = []
+        self.started = time.time()
+
+        def window_open(attr):
+            return lambda: (getattr(self, attr, None) is not None
+                            and getattr(self, attr).isVisible())
+
+        def panel_open(attr):
+            return lambda: getattr(self, attr).isVisible()
+
+        # one list drives the dock, the launcher and the 'open' command
+        self.apps = [
+            ("notes", "Notes", self.focus_notes, panel_open("notes_win")),
+            ("folder", "Filecore", self.focus_files, panel_open("files_win")),
+            ("terminal", "Terminal", self.focus_terminal,
+             panel_open("terminal_win")),
+            ("monitor", "System Monitor", self.focus_monitor,
+             panel_open("monitor_win")),
+            ("music", "Music", self.focus_music, panel_open("music_win")),
+            ("spark", "bankserAI", self.open_bankserai,
+             window_open("ai_window")),
+            ("brush", "ART Studio", self.open_art, window_open("art_window")),
+            ("matrix", "Matrix Rain", self.open_matrix,
+             window_open("matrix_window")),
+            ("skull", "PASTESHELL", self.open_pasteshell,
+             window_open("paste_window")),
+            ("lock", "Security Center", self.show_security, None),
+        ]
 
         # never leave the local model server running behind our back
         app = QApplication.instance()
@@ -3968,6 +5291,28 @@ class BankserDesktop(QMainWindow):
             app.aboutToQuit.connect(self.shutdown_model)
 
         self.build_desktop()
+        self.launcher = Launcher(self)
+
+        for keys, action in (("Ctrl+Space", self.toggle_launcher),
+                             ("Ctrl+Alt+T", self.focus_terminal),
+                             ("Ctrl+Alt+F", self.focus_files),
+                             ("Ctrl+S", self.save_notes),
+                             ("F11", self.toggle_fullscreen)):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.activated.connect(action)
+
+        self._net_last = None
+        self._monitor_ticks = 0
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.timeout.connect(self.update_monitor)
+        self.monitor_timer.start(1500)
+        self.update_monitor()
+
+        # dock dots follow which apps are open
+        self.dock_timer = QTimer(self)
+        self.dock_timer.timeout.connect(
+            lambda: [b.update() for b in self.dock_buttons])
+        self.dock_timer.start(600)
 
     # ------------------------------------------------------
     # LAYOUT
@@ -3982,11 +5327,12 @@ class BankserDesktop(QMainWindow):
         root.addWidget(self.build_top_panel())
 
         body = QWidget()
+        body.setObjectName("desktopbody")
         body.setAttribute(Qt.WA_TranslucentBackground)
         grid = QGridLayout(body)
         self.grid = grid
-        grid.setContentsMargins(11, 11, 11, 9)
-        grid.setSpacing(9)
+        grid.setContentsMargins(14, 14, 14, 6)
+        grid.setSpacing(12)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 2)
@@ -4007,6 +5353,9 @@ class BankserDesktop(QMainWindow):
             self.monitor_win: (0, 2, 2, 1),
         }
         self.zoomed_window = None
+        self.floating = {}      # panel -> geometry, once dragged out of grid
+        for window in self.panel_home:
+            window.on_drag_start = self.float_panel
 
         grid.addWidget(self.notes_win, 0, 0)
         grid.addWidget(self.files_win, 0, 1)
@@ -4024,23 +5373,24 @@ class BankserDesktop(QMainWindow):
     def build_top_panel(self):
 
         panel = QWidget()
-        panel.setFixedHeight(33)
+        panel.setFixedHeight(36)
         panel.setObjectName("toppanel")
+        panel.setAttribute(Qt.WA_StyledBackground)
         self.top_panel = panel
         self.style_top_panel()
 
         layout = QHBoxLayout(panel)
-        layout.setContentsMargins(6, 2, 4, 2)
+        layout.setContentsMargins(8, 4, 6, 4)
         layout.setSpacing(4)
 
         # --- menu button (Mint style)
         menu_button = QPushButton(f"  {APP_NAME}")
-        menu_button.setToolTip("Main menu")
+        menu_button.setToolTip("Applications  (Ctrl+Space)")
         menu_button.setCursor(Qt.PointingHandCursor)
         menu_button.setFixedHeight(26)
         self.menu_button = menu_button
         self.style_menu_button()
-        menu_button.clicked.connect(self.show_launcher_menu)
+        menu_button.clicked.connect(self.toggle_launcher)
         layout.addWidget(menu_button)
 
         # --- window list
@@ -4059,18 +5409,27 @@ class BankserDesktop(QMainWindow):
         tray_layout.setContentsMargins(0, 0, 4, 0)
         tray_layout.setSpacing(2)
 
-        for kind, tip in (("network", "Network: offline"),
-                          ("volume", "Volume: 70%"),
-                          ("power", "Power options")):
-            button = IconButton(kind, tip, 26, theme_bound=True)
-            button.clicked.connect(self.show_launcher_menu)
+        self.battery_label = QLabel()
+        self.battery_label.setFont(ui_font(9))
+        tray_layout.addWidget(self.battery_label)
+
+        self.tray = {}
+        for kind, tip, action in (
+                ("network", "Network", self.focus_monitor),
+                ("volume", "Volume: 70%", self.show_volume_menu),
+                ("power", "Power options", self.show_power_menu)):
+            button = IconButton(kind, tip, 28, theme_bound=True)
+            button.clicked.connect(action)
             tray_layout.addWidget(button)
+            self.tray[kind] = button
 
         layout.addWidget(tray)
 
-        # --- clock
-        self.clock = QLabel()
-        self.clock.setFont(ui_font(10))
+        # --- clock (click for a calendar)
+        self.clock = QPushButton()
+        self.clock.setCursor(Qt.PointingHandCursor)
+        self.clock.setFont(ui_font(10, bold=True))
+        self.clock.clicked.connect(self.show_calendar)
         self.style_clock()
         layout.addWidget(self.clock)
 
@@ -4102,26 +5461,27 @@ class BankserDesktop(QMainWindow):
     def style_top_panel(self):
         self.top_panel.setStyleSheet(f"""
             QWidget#toppanel {{
-                background: {PANEL_BG};
-                border-bottom: 1px solid #2a2a2a;
+                background: {CURRENT_THEME.panel_glass};
+                border-bottom: 1px solid {CURRENT_THEME.hairline};
             }}
-            QLabel {{ color: {TEXT_DIM}; }}
+            QLabel {{ color: {TEXT_DIM}; padding: 0 4px; }}
         """)
 
     def style_menu_button(self):
         self.menu_button.setStyleSheet(f"""
             QPushButton {{
-                background: {MINT_DARK};
-                color: {TEXT};
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {MINT}, stop:1 {MINT_DARK});
+                color: #ffffff;
                 border: none;
-                border-radius: 5px;
-                padding: 0 12px 0 9px;
+                border-radius: 13px;
+                padding: 0 14px 0 10px;
                 font-size: 12px;
                 font-weight: bold;
             }}
             QPushButton:hover {{
-                background: {MINT};
-                color: {CURRENT_THEME.on_accent};
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {MINT_LIGHT}, stop:1 {MINT});
             }}
         """)
 
@@ -4139,20 +5499,27 @@ class BankserDesktop(QMainWindow):
         """)
 
     def style_clock(self):
-        self.clock.setStyleSheet(
-            f"color: {TEXT}; padding: 0 10px; background: transparent;")
+        self.clock.setStyleSheet(f"""
+            QPushButton {{
+                color: {TEXT}; background: transparent; border: none;
+                border-radius: 8px; padding: 3px 12px;
+            }}
+            QPushButton:hover {{ background: {CURRENT_THEME.accent_soft}; }}
+        """)
 
     def style_taskbar(self):
-        self.taskbar.setStyleSheet(f"""
-            QWidget#taskbar {{
-                background: {PANEL_BG};
-                border-top: 1px solid #2a2a2a;
+        self.dock.setStyleSheet(f"""
+            QFrame#dock {{
+                background: {CURRENT_THEME.panel_glass};
+                border: 1px solid {CURRENT_THEME.hairline};
+                border-radius: 20px;
             }}
+            QFrame#docksep {{ background: {CURRENT_THEME.hairline}; }}
         """)
 
     def style_terminal(self):
         self.terminal_output.setStyleSheet(
-            f"background: {TERMINAL_BG}; color: #cfdcc6;")
+            f"background: {_rgba(TERMINAL_BG, 235)}; color: #cfdcc6;")
 
     def style_path_label(self):
         self.path_label.setStyleSheet(
@@ -4196,6 +5563,8 @@ class BankserDesktop(QMainWindow):
 
         for gauge in self.gauges:
             gauge.update()
+        self.cpu_graph.update()
+        self.refresh_files()          # folder icons follow the accent
 
         self.wallpaper.update()
         self.update()
@@ -4206,54 +5575,52 @@ class BankserDesktop(QMainWindow):
 
     def build_bottom_panel(self):
 
+        # transparent strip with a floating, centred glass dock
         panel = QWidget()
-        panel.setFixedHeight(52)
-        panel.setObjectName("taskbar")
+        panel.setAttribute(Qt.WA_TranslucentBackground)
         self.taskbar = panel
-        self.style_taskbar()
 
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(8, 4, 8, 4)
+        outer = QHBoxLayout(panel)
+        outer.setContentsMargins(0, 4, 0, 10)
+        outer.addStretch(1)
+
+        dock = QFrame()
+        dock.setObjectName("dock")
+        self.dock = dock
+        self.style_taskbar()
+        outer.addWidget(dock)
+        outer.addStretch(1)
+
+        shadow = QGraphicsDropShadowEffect(dock)
+        shadow.setBlurRadius(30)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        shadow.setOffset(0, 6)
+        dock.setGraphicsEffect(shadow)
+
+        layout = QHBoxLayout(dock)
+        layout.setContentsMargins(10, 6, 10, 2)
         layout.setSpacing(5)
 
-        # --- show applications
-        apps_button = IconButton("apps", "Show Applications", 36,
-                                 theme_bound=True)
-        apps_button.clicked.connect(self.show_launcher_menu)
-        layout.addWidget(apps_button)
+        def separator():
+            line = QFrame()
+            line.setObjectName("docksep")
+            line.setFixedSize(1, 26)
+            layout.addWidget(line)
 
-        separator = QFrame()
-        separator.setFixedWidth(1)
-        separator.setFixedHeight(26)
-        separator.setStyleSheet(f"background: {BORDER};")
-        layout.addWidget(separator)
+        self.dock_buttons = []
 
-        # --- launchers
-        launchers = [
-            ("notes", "Notes", self.focus_notes),
-            ("folder", "Filecore", self.focus_files),
-            ("terminal", "Terminal", self.focus_terminal),
-            ("monitor", "System Monitor", self.focus_monitor),
-            ("spark", "bankserAI", self.open_bankserai),
-            ("brush", "ART Studio", self.open_art),
-            ("matrix", "Matrix Rain", self.open_matrix),
-            ("music", "Music", self.focus_music),
-            ("skull", "PASTESHELL", self.open_pasteshell),
-            ("lock", "Security Center", self.show_security),
-        ]
-
-        for kind, tip, action in launchers:
-            button = IconButton(kind, tip, 36, theme_bound=True)
+        def add(kind, tip, action, running=None, size=36):
+            button = DockButton(kind, tip, running, size)
             button.clicked.connect(action)
             layout.addWidget(button)
+            self.dock_buttons.append(button)
 
-        layout.addStretch(1)
-
-        # --- show desktop
-        show_desktop = IconButton("minimize", "Show desktop", 32,
-                                  theme_bound=True)
-        show_desktop.clicked.connect(self.toggle_panels)
-        layout.addWidget(show_desktop)
+        add("apps", "Show Applications  (Ctrl+Space)", self.toggle_launcher)
+        separator()
+        for kind, name, action, running in self.apps:
+            add(kind, name, action, running)
+        separator()
+        add("minimize", "Show desktop", self.toggle_panels, size=32)
 
         return panel
 
@@ -4268,9 +5635,13 @@ class BankserDesktop(QMainWindow):
 
         self.note_search = QLineEdit()
         self.note_search.setPlaceholderText("Search notes…")
+        self.note_search.addAction(icon_pixmap("search", 16, TEXT_DIM),
+                                   QLineEdit.LeadingPosition)
+        self.note_search.textChanged.connect(self.highlight_notes)
         panel.body.addWidget(self.note_search)
 
         self.notes = QTextEdit()
+        self.notes.setAcceptRichText(False)
         self.notes.setPlaceholderText("Your thoughts, ideas and plans…")
         self.notes.setFont(ui_font(11))
 
@@ -4281,9 +5652,23 @@ class BankserDesktop(QMainWindow):
 
         panel.body.addWidget(self.notes, 1)
 
-        save = QPushButton("Save notes")
+        # autosave a moment after typing stops
+        self.note_timer = QTimer(self)
+        self.note_timer.setSingleShot(True)
+        self.note_timer.setInterval(800)
+        self.note_timer.timeout.connect(self.autosave_notes)
+        self.notes.textChanged.connect(lambda: self.note_timer.start())
+
+        row = QHBoxLayout()
+        self.note_status = QLabel()
+        self.note_status.setObjectName("status")
+        row.addWidget(self.note_status, 1)
+        save = QPushButton("Save")
+        save.setToolTip("Ctrl+S")
         save.clicked.connect(self.save_notes)
-        panel.body.addWidget(save)
+        row.addWidget(save)
+        panel.body.addLayout(row)
+        self.update_note_status("Autosave on")
 
         return panel
 
@@ -4292,29 +5677,52 @@ class BankserDesktop(QMainWindow):
         panel = MintWindow("FILECORE", "folder",
                            on_maximize=lambda w: self.toggle_zoom(w))
 
-        path = QLabel("⌂   /home/bankser")
+        self.cwd = Path.home()
+
+        nav = QHBoxLayout()
+        nav.setSpacing(4)
+        up = IconButton("up", "Up one folder", 30, theme_bound=True)
+        up.clicked.connect(lambda: self.browse(self.cwd.parent))
+        home = IconButton("home", "Home folder", 30, theme_bound=True)
+        home.clicked.connect(lambda: self.browse(Path.home()))
+        nav.addWidget(up)
+        nav.addWidget(home)
+
+        path = QLabel()
+        path.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.path_label = path
         self.style_path_label()
-        panel.body.addWidget(path)
+        nav.addWidget(path, 1)
+        panel.body.addLayout(nav)
+
+        self.file_filter = QLineEdit()
+        self.file_filter.setPlaceholderText("Filter this folder…")
+        self.file_filter.addAction(icon_pixmap("search", 16, TEXT_DIM),
+                                   QLineEdit.LeadingPosition)
+        self.file_filter.textChanged.connect(lambda _: self.refresh_files())
+        panel.body.addWidget(self.file_filter)
 
         self.file_list = QListWidget()
-        self.file_list.setFont(mono_font(9))
+        self.file_list.setIconSize(QSize(16, 16))
+        self.file_list.itemActivated.connect(self.file_activated)
         panel.body.addWidget(self.file_list, 1)
 
-        self.refresh_files()
-
         row = QHBoxLayout()
+        self.file_status = QLabel()
+        self.file_status.setObjectName("status")
+        row.addWidget(self.file_status, 1)
 
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_files)
-
-        open_folder = QPushButton("Open folder")
-        open_folder.clicked.connect(self.open_home)
-
         row.addWidget(refresh)
+
+        open_folder = QPushButton("Open in system")
+        open_folder.clicked.connect(lambda: self.open_path(self.cwd))
         row.addWidget(open_folder)
 
         panel.body.addLayout(row)
+
+        self.refresh_files()
 
         return panel
 
@@ -4329,12 +5737,13 @@ class BankserDesktop(QMainWindow):
         self.terminal_output.setLineWrapMode(QTextEdit.NoWrap)
         self.style_terminal()
         self.terminal_output.setPlainText(
-            f"{APP_NAME} Terminal [demo shell]\n"
-            "Type 'help' for commands, '-welcome' for the bank.\n\n"
+            f"{APP_NAME} Terminal [bsh]\n"
+            "Type 'help' for commands, 'neofetch' for system info.\n"
+            "↑/↓ walks history · Tab completes\n"
         )
         panel.body.addWidget(self.terminal_output, 1)
 
-        self.terminal_input = QLineEdit()
+        self.terminal_input = HistoryLineEdit(TERMINAL_COMMANDS)
         self.terminal_input.setFont(mono_font(9))
         self.terminal_input.setPlaceholderText("bankser@desktop:~$ ")
         self.terminal_input.returnPressed.connect(self.run_command)
@@ -4347,37 +5756,82 @@ class BankserDesktop(QMainWindow):
         panel = MintWindow("MUSIC", "music",
                            on_maximize=lambda w: self.toggle_zoom(w))
 
-        panel.body.addStretch(1)
+        self.music_dir = Path.home() / "Music"
+        self.tracks = []
+        self.track_index = -1
 
-        icon = IconWidget("music", 74, "#f2a6d0")
-        holder = QWidget()
-        holder_layout = QHBoxLayout(holder)
-        holder_layout.setContentsMargins(0, 0, 0, 0)
-        holder_layout.addStretch(1)
-        holder_layout.addWidget(icon)
-        holder_layout.addStretch(1)
-        panel.body.addWidget(holder)
+        header = QHBoxLayout()
+        header.addWidget(IconWidget("music", 30, MINT_LIGHT, theme_bound=True))
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        self.now_playing = QLabel("Nothing playing")
+        self.now_playing.setObjectName("strong")
+        self.now_playing.setFont(ui_font(11, bold=True))
+        self.now_playing.setSizePolicy(QSizePolicy.Ignored,
+                                       QSizePolicy.Preferred)
+        self.music_time = QLabel("0:00 / 0:00")
+        self.music_time.setObjectName("status")
+        titles.addWidget(self.now_playing)
+        titles.addWidget(self.music_time)
+        header.addLayout(titles, 1)
+        panel.body.addLayout(header)
 
-        title = QLabel(f"{APP_NAME} Audio")
-        title.setAlignment(Qt.AlignCenter)
-        title.setFont(ui_font(15, bold=True))
-        title.setObjectName("strong")
-        panel.body.addWidget(title)
+        self.music_seek = QSlider(Qt.Horizontal)
+        panel.body.addWidget(self.music_seek)
 
-        description = QLabel(
-            "Your personal music space.\nOpen your local music folder.")
-        description.setAlignment(Qt.AlignCenter)
-        description.setObjectName("muted")
-        panel.body.addWidget(description)
+        controls = QHBoxLayout()
+        controls.setSpacing(2)
+        for kind, tip, action in (("prev", "Previous", self.music_prev),
+                                  ("play", "Play / pause", self.music_toggle),
+                                  ("next", "Next", self.music_next)):
+            button = IconButton(kind, tip, 32, theme_bound=True)
+            button.clicked.connect(action)
+            controls.addWidget(button)
+            if kind == "play":
+                self.play_button = button
+        controls.addStretch(1)
+        controls.addWidget(IconWidget("volume", 18, TEXT_DIM))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setFixedWidth(90)
+        controls.addWidget(self.volume_slider)
+        panel.body.addLayout(controls)
 
-        music_button = QPushButton("Open music folder")
-        music_button.clicked.connect(
-            lambda: self.open_path(Path.home() / "Music")
-        )
-        panel.body.addWidget(music_button)
+        self.track_list = QListWidget()
+        self.track_list.itemActivated.connect(
+            lambda item: self.music_play(self.track_list.row(item)))
+        panel.body.addWidget(self.track_list, 1)
 
-        panel.body.addStretch(1)
+        row = QHBoxLayout()
+        choose = QPushButton("Choose folder…")
+        choose.clicked.connect(self.music_choose_folder)
+        open_folder = QPushButton("Open folder")
+        open_folder.clicked.connect(lambda: self.open_path(self.music_dir))
+        row.addWidget(choose)
+        row.addWidget(open_folder)
+        panel.body.addLayout(row)
 
+        if QMediaPlayer is None:
+            self.player = None
+            self.track_list.addItem("Qt Multimedia is not available.")
+            return panel
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.audio.setVolume(0.7)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+        self.music_seek.sliderMoved.connect(self.player.setPosition)
+        self.player.durationChanged.connect(
+            lambda ms: self.music_seek.setRange(0, ms))
+        self.player.positionChanged.connect(self.music_position)
+        self.player.playbackStateChanged.connect(self.music_state)
+        self.player.mediaStatusChanged.connect(
+            lambda status: status == QMediaPlayer.EndOfMedia
+            and self.music_next())
+
+        self.load_music()
         return panel
 
     def monitor_panel(self):
@@ -4388,12 +5842,20 @@ class BankserDesktop(QMainWindow):
 
         gauges = QHBoxLayout()
 
-        for title, value in (("MEMORY", 38), ("DISK", 72), ("CPU", 8)):
+        for title, value in (("CPU", 8), ("MEMORY", 38), ("DISK", 72)):
             gauge = Gauge(title, value)
             self.gauges.append(gauge)
             gauges.addWidget(gauge)
+        self.cpu_gauge, self.mem_gauge, self.disk_gauge = self.gauges
 
         panel.body.addLayout(gauges)
+
+        section = QLabel("CPU HISTORY")
+        section.setFont(ui_font(9, bold=True))
+        section.setObjectName("dim")
+        panel.body.addWidget(section)
+        self.cpu_graph = Sparkline()
+        panel.body.addWidget(self.cpu_graph)
 
         section = QLabel("NETWORK & SYSTEM")
         section.setFont(ui_font(9, bold=True))
@@ -4416,6 +5878,7 @@ class BankserDesktop(QMainWindow):
              f"Python: {platform.python_version()}\n"
              "Uptime: Session active"),
         ]
+        self.info_labels = []
 
         for heading, text in sections:
             column = QVBoxLayout()
@@ -4430,6 +5893,7 @@ class BankserDesktop(QMainWindow):
             value.setWordWrap(True)
             value.setFont(mono_font(9))
             value.setObjectName("dimpad")
+            self.info_labels.append(value)
 
             column.addWidget(title)
             column.addWidget(value, 1)
@@ -4445,6 +5909,7 @@ class BankserDesktop(QMainWindow):
 
         self.processes = QListWidget()
         self.processes.setFont(mono_font(9))
+        self.processes.setToolTip("Top processes by CPU")
         self.processes.addItems([
             "bankser-shell       Running",
             "filecore             Ready",
@@ -4470,6 +5935,8 @@ class BankserDesktop(QMainWindow):
         if self.zoomed_window is not None:
             self.restore_panel(self.zoomed_window)
 
+        if window in self.floating:
+            self.floating[window] = window.geometry()   # come back here
         self.grid.removeWidget(window)
         self.grid.addWidget(window, 0, 0, 2, 3)
         self.zoomed_window = window
@@ -4486,9 +5953,11 @@ class BankserDesktop(QMainWindow):
         if self.zoomed_window is not window:
             return
 
-        row, column, row_span, column_span = self.panel_home[window]
         self.grid.removeWidget(window)
-        self.grid.addWidget(window, row, column, row_span, column_span)
+        if window in self.floating:
+            window.setGeometry(self.floating[window])
+        else:
+            self.grid.addWidget(window, *self.panel_home[window])
         self.zoomed_window = None
 
         if window is self.terminal_win:
@@ -4497,6 +5966,26 @@ class BankserDesktop(QMainWindow):
 
         window.set_zoomed(False)
         window.raise_()
+
+    def float_panel(self, window):
+        """Title bar grabbed: lift the panel out of the grid so it can move.
+        Returns False while maximized (restore it first)."""
+        if self.zoomed_window is window:
+            return False
+        if window not in self.floating:
+            geometry = window.geometry()
+            self.grid.removeWidget(window)
+            window.setGeometry(geometry)
+            self.floating[window] = geometry
+        return True
+
+    def reset_layout(self):
+        """Snap every dragged panel back into the grid."""
+        if self.zoomed_window is not None:
+            self.restore_panel(self.zoomed_window)
+        for window in self.floating:
+            self.grid.addWidget(window, *self.panel_home[window])
+        self.floating.clear()
 
     def toggle_zoom(self, window):
         if self.zoomed_window is window:
@@ -4516,6 +6005,7 @@ class BankserDesktop(QMainWindow):
         theme = use_theme(number - 1)
         self.refresh_theme()
         save_theme(number)
+        self.notify(f"Theme changed to {theme.name.title()}")
         return theme
 
     def theme_list(self):
@@ -4533,7 +6023,65 @@ class BankserDesktop(QMainWindow):
     # ------------------------------------------------------
 
     def update_clock(self):
-        self.clock.setText(datetime.now().strftime("%a %d %b  %H:%M"))
+        self.clock.setText(datetime.now().strftime("%a %d %b   %H:%M"))
+
+    def notify(self, text):
+        Toast(self.wallpaper, text)
+
+    def toggle_launcher(self):
+        if self.launcher.isVisible():
+            self.launcher.hide()
+        else:
+            self.launcher.open()
+
+    def _popup(self, widget, anchor):
+        """Show any widget as a drop-down under `anchor`."""
+        menu = QMenu(self)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(widget)
+        menu.addAction(action)
+        point = anchor.mapToGlobal(QPoint(0, anchor.height() + 4))
+        menu.exec(point)
+
+    def show_calendar(self):
+        calendar = QCalendarWidget()
+        calendar.setGridVisible(False)
+        calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        calendar.setMinimumSize(300, 230)
+        self._popup(calendar, self.clock)
+
+    def show_volume_menu(self):
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(12, 8, 12, 8)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setFixedWidth(170)
+        slider.setValue(self.volume_slider.value())
+        label = QLabel(f"{slider.value()}%")
+        label.setFixedWidth(36)
+        slider.valueChanged.connect(self.volume_slider.setValue)
+        slider.valueChanged.connect(lambda v: label.setText(f"{v}%"))
+        row.addWidget(IconWidget("volume", 18, TEXT_DIM))
+        row.addWidget(slider)
+        row.addWidget(label)
+        self._popup(holder, self.tray["volume"])
+
+    def show_power_menu(self):
+        menu = QMenu(self)
+        for kind, text, action, colour in (
+                ("apps", "Applications", self.toggle_launcher, TEXT),
+                ("minimize", "Minimize desktop", self.showMinimized, TEXT),
+                ("leaf", f"About {APP_NAME}", self.show_about, TEXT),
+                (None, None, None, None),
+                ("power", "Shut down", self.close, "#ff8a80")):
+            if kind is None:
+                menu.addSeparator()
+                continue
+            menu.addAction(icon_pixmap(kind, 16, colour), text) \
+                .triggered.connect(action)
+        button = self.tray["power"]
+        menu.exec(button.mapToGlobal(QPoint(0, button.height() + 4)))
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -4548,30 +6096,118 @@ class BankserDesktop(QMainWindow):
         for win in windows:
             win.setVisible(not visible)
 
+    # --- notes ----------------------------------------------
+
+    def update_note_status(self, prefix):
+        words = len(self.notes.toPlainText().split())
+        self.note_status.setText(f"{prefix}  ·  {words} words")
+
+    def autosave_notes(self):
+        try:
+            NOTES_FILE.write_text(self.notes.toPlainText(), encoding="utf-8")
+        except OSError as error:
+            self.update_note_status(f"Not saved: {error.strerror}")
+            return False
+        self.update_note_status(
+            "Saved " + datetime.now().strftime("%H:%M:%S"))
+        return True
+
     def save_notes(self):
-        NOTES_FILE.write_text(self.notes.toPlainText(), encoding="utf-8")
-        QMessageBox.information(self, f"{APP_NAME} Notes", "Notes saved!")
+        self.note_timer.stop()
+        if self.autosave_notes():
+            self.notify("Notes saved")
+
+    def highlight_notes(self, text):
+        """Highlight every match of the search box inside the notes."""
+        selections = []
+        if text:
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor(MINT))
+            fmt.setForeground(QColor(CURRENT_THEME.on_accent))
+            document = self.notes.document()
+            cursor = document.find(text)
+            while not cursor.isNull():
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = cursor
+                selection.format = fmt
+                selections.append(selection)
+                cursor = document.find(text, cursor)
+            if selections:
+                jump = QTextCursor(selections[0].cursor)
+                jump.clearSelection()
+                self.notes.setTextCursor(jump)
+            self.note_status.setText(f"{len(selections)} matches")
+        else:
+            self.update_note_status("Autosave on")
+        self.notes.setExtraSelections(selections)
+
+    # --- files ----------------------------------------------
+
+    def browse(self, path):
+        path = Path(path).expanduser()
+        if not _is_dir(path):
+            return False
+        self.cwd = path.resolve()
+        self.file_filter.blockSignals(True)
+        self.file_filter.clear()
+        self.file_filter.blockSignals(False)
+        self.refresh_files()
+        return True
 
     def refresh_files(self):
         self.file_list.clear()
+        needle = self.file_filter.text().lower()
         try:
-            items = sorted(HOME.iterdir())
-        except OSError:
-            items = []
+            entries = [p for p in self.cwd.iterdir()
+                       if not p.name.startswith(".")
+                       and needle in p.name.lower()]
+        except OSError as error:
+            entries = []
+            self.file_list.addItem(f"Cannot open: {error.strerror}")
 
-        for item in items:
-            prefix = "[dir]  " if item.is_dir() else "[file] "
-            self.file_list.addItem(prefix + item.name)
+        entries.sort(key=lambda p: (not _is_dir(p), p.name.lower()))
+        folder_icon = icon_pixmap("folder", 16, MINT_LIGHT)
+        file_icon = icon_pixmap("file", 16, TEXT_DIM)
 
-        if not self.file_list.count():
-            self.file_list.addItem("(empty)")
+        for entry in entries[:500]:
+            is_dir = _is_dir(entry)
+            item = QListWidgetItem(folder_icon if is_dir else file_icon,
+                                   entry.name)
+            item.setData(Qt.UserRole, str(entry))
+            if not is_dir:
+                try:
+                    stat = entry.stat()
+                    item.setToolTip(
+                        f"{_human(stat.st_size)}  ·  modified "
+                        + datetime.fromtimestamp(stat.st_mtime)
+                        .strftime("%d %b %Y %H:%M"))
+                except OSError:
+                    pass
+            self.file_list.addItem(item)
+
+        folders = sum(1 for e in entries if _is_dir(e))
+        self.file_status.setText(
+            f"{folders} folders · {len(entries) - folders} files")
+        self.path_label.setText(str(self.cwd))
+        self.path_label.setToolTip(str(self.cwd))
+
+    def file_activated(self, item):
+        target = item.data(Qt.UserRole)
+        if not target:
+            return
+        target = Path(target)
+        if _is_dir(target):
+            self.browse(target)
+        else:
+            self.open_path(target)
 
     def open_home(self):
         self.open_path(HOME)
 
     def open_path(self, path):
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
 
             if sys.platform.startswith("win"):
                 os.startfile(str(path))
@@ -4587,42 +6223,187 @@ class BankserDesktop(QMainWindow):
     # MENU / DOCK ACTIONS
     # ------------------------------------------------------
 
-    def show_launcher_menu(self):
-
+    def contextMenuEvent(self, event):
+        """Right-click on the wallpaper: every app plus themes."""
         menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background: {HEADER_BG};
-                color: {TEXT};
-                border: 1px solid {BORDER};
-                border-radius: 8px;
-                padding: 6px;
-            }}
-            QMenu::item {{
-                padding: 7px 24px 7px 14px;
-                border-radius: 5px;
-            }}
-            QMenu::item:selected {{
-                background: {MINT};
-                color: {CURRENT_THEME.on_accent};
-            }}
-            QMenu::separator {{ height: 1px; background: {BORDER}; margin: 5px 8px; }}
-        """)
-
-        menu.addAction("Notes").triggered.connect(self.focus_notes)
-        menu.addAction("Filecore").triggered.connect(self.focus_files)
-        menu.addAction("Terminal").triggered.connect(self.focus_terminal)
-        menu.addAction("System Monitor").triggered.connect(self.focus_monitor)
-        menu.addAction("Music").triggered.connect(self.focus_music)
-        menu.addAction("bankserAI").triggered.connect(self.open_bankserai)
-        menu.addAction("ART Studio").triggered.connect(self.open_art)
-        menu.addAction("Matrix Rain").triggered.connect(self.open_matrix)
-        menu.addAction("PASTESHELL").triggered.connect(self.open_pasteshell)
+        for kind, name, action, _running in self.apps:
+            menu.addAction(icon_pixmap(kind, 16, MINT_LIGHT), name) \
+                .triggered.connect(action)
         menu.addSeparator()
-        menu.addAction("Security Center").triggered.connect(self.show_security)
+        themes = menu.addMenu("Themes")
+        for theme in THEMES:
+            themes.addAction(
+                ("● " if theme is CURRENT_THEME else "   ") + theme.name.title()
+            ).triggered.connect(
+                lambda _=False, n=theme.index: self.set_theme(n))
+        menu.addAction("Reset window layout").triggered.connect(
+            self.reset_layout)
         menu.addAction("About BANKSER'").triggered.connect(self.show_about)
+        menu.exec(event.globalPos())
 
-        menu.exec(self.cursor().pos())
+    # ------------------------------------------------------
+    # MUSIC PLAYER
+    # ------------------------------------------------------
+
+    def load_music(self):
+        self.track_list.clear()
+        try:
+            found = (p for p in self.music_dir.rglob("*")
+                     if p.suffix.lower() in AUDIO_EXTENSIONS)
+            self.tracks = sorted(itertools.islice(found, 500))
+        except OSError:
+            self.tracks = []
+        note_icon = icon_pixmap("music", 16, MINT_LIGHT)
+        for track in self.tracks:
+            self.track_list.addItem(QListWidgetItem(note_icon, track.stem))
+        if not self.tracks:
+            self.track_list.addItem(
+                f"No music in {self.music_dir}. Choose a folder below.")
+
+    def music_choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose music folder", str(self.music_dir))
+        if folder:
+            self.music_dir = Path(folder)
+            self.load_music()
+
+    def music_play(self, index):
+        if self.player is None or not self.tracks:
+            return
+        self.track_index = index % len(self.tracks)
+        track = self.tracks[self.track_index]
+        self.player.setSource(QUrl.fromLocalFile(str(track)))
+        self.player.play()
+        self.now_playing.setText(track.stem)
+        self.now_playing.setToolTip(str(track))
+        self.track_list.setCurrentRow(self.track_index)
+
+    def music_toggle(self):
+        if self.player is None:
+            return
+        if self.track_index < 0:
+            self.music_play(0)
+        elif self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def music_next(self):
+        self.music_play(self.track_index + 1)
+
+    def music_prev(self):
+        self.music_play(max(self.track_index, 0) - 1)
+
+    def set_volume(self, value):
+        self.audio.setVolume(value / 100.0)
+        self.tray["volume"].setToolTip(f"Volume: {value}%")
+
+    def music_state(self, state):
+        playing = state == QMediaPlayer.PlayingState
+        self.play_button.kind = "pause" if playing else "play"
+        self.play_button.update()
+
+    def music_position(self, ms):
+        if not self.music_seek.isSliderDown():
+            self.music_seek.setValue(ms)
+
+        def clock(value):
+            return f"{value // 60000}:{value // 1000 % 60:02d}"
+
+        self.music_time.setText(
+            f"{clock(ms)} / {clock(self.player.duration())}")
+
+    # ------------------------------------------------------
+    # LIVE SYSTEM MONITOR
+    # ------------------------------------------------------
+
+    @staticmethod
+    def local_address():
+        """(interface, IPv4) of the first connected adapter, or None."""
+        stats = psutil.net_if_stats()
+        for name, addresses in psutil.net_if_addrs().items():
+            if not (stats.get(name) and stats[name].isup):
+                continue
+            for address in addresses:
+                ip = address.address
+                if (address.family == socket.AF_INET
+                        and not ip.startswith(("127.", "169.254."))):
+                    return name, ip
+        return None
+
+    def top_processes(self, count=8):
+        """Busiest processes as (name, cpu %, memory bytes)."""
+        cores = psutil.cpu_count() or 1
+        rows = []
+        # ponytail: walks every process on the UI thread (~50 ms on
+        # Windows); move to a worker thread if the monitor ever stutters
+        for proc in psutil.process_iter(["name", "cpu_percent",
+                                         "memory_info"]):
+            info = proc.info
+            if not info["name"] or info["name"] == "System Idle Process":
+                continue
+            memory = info["memory_info"].rss if info["memory_info"] else 0
+            rows.append((info["name"], (info["cpu_percent"] or 0) / cores,
+                         memory))
+        rows.sort(key=lambda r: (r[1], r[2]), reverse=True)
+        return rows[:count]
+
+    def update_monitor(self):
+        if psutil is None:
+            return
+        self._monitor_ticks += 1
+
+        cpu = psutil.cpu_percent(None)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage(Path.home().anchor or "/")
+
+        self.cpu_gauge.set_value(cpu, f"{psutil.cpu_count()} threads")
+        self.mem_gauge.set_value(
+            memory.percent,
+            f"{_human(memory.used)} / {_human(memory.total)}")
+        self.disk_gauge.set_value(disk.percent,
+                                  f"{_human(disk.free)} free")
+        self.cpu_graph.push(cpu)
+
+        net, now = psutil.net_io_counters(), time.monotonic()
+        if self._net_last:
+            last, then = self._net_last
+            seconds = max(now - then, 0.001)
+            down = (net.bytes_recv - last.bytes_recv) / seconds
+            up = (net.bytes_sent - last.bytes_sent) / seconds
+            self.info_labels[1].setText(
+                f"↓ {_human(down)}/s\n\n↑ {_human(up)}/s")
+        self._net_last = (net, now)
+
+        battery = psutil.sensors_battery() if hasattr(
+            psutil, "sensors_battery") else None
+        if battery is not None:
+            plug = "⚡ " if battery.power_plugged else ""
+            self.battery_label.setText(f"{plug}{battery.percent:.0f}%")
+
+        # slower details every other tick
+        if self._monitor_ticks % 2 != 1:
+            return
+
+        link = self.local_address()
+        if link:
+            self.info_labels[0].setText(
+                f"{link[0]}\n{link[1]}\n\nStatus: Online")
+            self.tray["network"].setToolTip(f"Online · {link[0]} · {link[1]}")
+        else:
+            self.info_labels[0].setText("No connection\n\nStatus: Offline")
+            self.tray["network"].setToolTip("Offline")
+
+        self.info_labels[2].setText(
+            f"{platform.system()} {platform.release()}\n"
+            f"Python {platform.python_version()}\n"
+            f"Up {_duration(time.time() - psutil.boot_time())}\n"
+            f"Session {_duration(time.time() - self.started)}")
+
+        self.processes.clear()
+        for name, cpu_share, memory in self.top_processes():
+            self.processes.addItem(
+                f"{name[:22]:<22} {cpu_share:5.1f}%  {_human(memory):>9}")
 
     def open_matrix(self):
         """Launch the MATRIX RAIN window."""
@@ -4755,6 +6536,10 @@ class BankserDesktop(QMainWindow):
 
     def closeEvent(self, event):
         """Shut the local model server down with the desktop."""
+        # give ART the chance to ask about an unsaved drawing first
+        if self.art_window is not None and not self.art_window.close():
+            event.ignore()
+            return
         self.shutdown_model()
         super().closeEvent(event)
 
@@ -4835,6 +6620,127 @@ class BankserDesktop(QMainWindow):
             "Click ▢ in the title bar to restore the window.</span>"
         )
 
+    def short_cwd(self):
+        try:
+            return "~/" + self.cwd.relative_to(Path.home()).as_posix() \
+                if self.cwd != Path.home() else "~"
+        except ValueError:
+            return self.cwd.as_posix()
+
+    def show_neofetch(self):
+        logo = [
+            "        .-~~~-.        ",
+            "      .'  /    '.      ",
+            "     /   /       \\     ",
+            "    |   /   _.-'  |    ",
+            "    |  / .-'      |    ",
+            "     \\ |/        /     ",
+            "      '.|     .'       ",
+            "        '-...-'        ",
+        ]
+        screen = (self.screen() or QApplication.primaryScreen()).size()
+        info = [
+            ("", f"{os.environ.get('USERNAME') or os.environ.get('USER') or 'bankser'}"
+                 f"@{platform.node()}"),
+            ("", "─" * 24),
+            ("OS", f"{APP_NAME} Desktop v{VERSION}"),
+            ("Host", f"{platform.system()} {platform.release()}"),
+            ("Python", platform.python_version()),
+            ("Shell", "bsh"),
+            ("Theme", CURRENT_THEME.name.title()),
+            ("Resolution", f"{screen.width()}x{screen.height()}"),
+        ]
+        if psutil is not None:
+            memory = psutil.virtual_memory()
+            info += [
+                ("CPU", f"{psutil.cpu_count()} threads · "
+                        f"{psutil.cpu_percent(None):.0f}% busy"),
+                ("Memory", f"{_human(memory.used)} / {_human(memory.total)}"),
+                ("Uptime", _duration(time.time() - psutil.boot_time())),
+            ]
+
+        rows = []
+        for i in range(max(len(logo), len(info))):
+            art = logo[i] if i < len(logo) else " " * len(logo[0])
+            line = f"<span style='color:{MINT}'>{html.escape(art)}</span>"
+            if i < len(info):
+                key, value = info[i]
+                if key:
+                    line += (f"<span style='color:{MINT_LIGHT};"
+                             f"font-weight:bold'>{key}</span>: ")
+                line += f"<span style='color:{TEXT}'>{html.escape(value)}</span>"
+            rows.append(line)
+        swatches = "".join(
+            f"<span style='color:{t.accent}'>███</span>" for t in THEMES)
+        rows.append(" " * len(logo[0]) + swatches)
+        self.term_html("<pre style='margin:0'>" + "<br>".join(
+            row.replace("  ", "&nbsp;&nbsp;") for row in rows) + "</pre>")
+
+    def run_extra_command(self, name, rest):
+        """The newer bsh commands. Returns True when one handled `name`."""
+        if name == "neofetch":
+            self.show_neofetch()
+        elif name == "calc":
+            try:
+                self.term_write(f"= {_safe_math(rest)}")
+            except Exception as error:
+                self.term_write(f"calc: {error or 'invalid expression'}")
+        elif name == "echo":
+            self.term_write(rest)
+        elif name == "whoami":
+            self.term_write(os.environ.get("USERNAME")
+                            or os.environ.get("USER") or "bankser")
+        elif name == "history":
+            self.term_write("\n".join(
+                f"{i:>4}  {c}"
+                for i, c in enumerate(self.terminal_input.history, 1)))
+        elif name == "pwd":
+            self.term_write(str(self.cwd))
+        elif name == "cd":
+            target = self.cwd / Path(rest or "~").expanduser()
+            if not self.browse(target):
+                self.term_write(f"cd: no such folder: {rest}")
+        elif name in ("ls", "dir"):
+            target = (self.cwd / Path(rest).expanduser()) if rest else self.cwd
+            try:
+                names = sorted(
+                    (p.name + ("/" if _is_dir(p) else ""))
+                    for p in target.iterdir() if not p.name.startswith("."))
+                self.term_write("  ".join(names) or "(empty)")
+            except OSError as error:
+                self.term_write(f"ls: {error.strerror}: {target}")
+        elif name == "open":
+            if self.launch_app(rest):
+                self.term_write(f"Opening {rest}…")
+            else:
+                self.term_write(f"open: no app called '{rest}'. "
+                                "Try notes, files, music, art, matrix…")
+        elif name == "top":
+            if psutil is None:
+                self.term_write("top: needs psutil (pip install psutil)")
+            else:
+                lines = [f"{'PROCESS':<24} {'CPU':>6}  {'MEMORY':>9}"]
+                lines += [f"{n[:24]:<24} {c:5.1f}%  {_human(m):>9}"
+                          for n, c, m in self.top_processes(12)]
+                self.term_write("\n".join(lines))
+        elif name == "uptime":
+            text = f"session: {_duration(time.time() - self.started)}"
+            if psutil is not None:
+                text = (f"system: {_duration(time.time() - psutil.boot_time())}"
+                        f"\n{text}")
+            self.term_write(text)
+        elif name == "notify":
+            self.notify(rest or "Hello from bsh")
+            self.term_write("Notification sent.")
+        elif name == "boot":
+            # keep a reference, or Python would collect the window at once
+            self._boot_replay = HudBootScreen(lambda: None)
+            self._boot_replay.showFullScreen()
+            self.term_write("Replaying the boot sequence… (any key skips)")
+        else:
+            return False
+        return True
+
     def run_command(self):
 
         command = self.terminal_input.text().strip()
@@ -4843,18 +6749,25 @@ class BankserDesktop(QMainWindow):
         if not command:
             return
 
+        self.terminal_input.remember(command)
         name = command.split()[0].lower()
+        rest = command[len(command.split()[0]):].strip()
 
         if name in ("clear", "cls"):
             self.terminal_output.clear()
             return
 
-        if name in ("color", "colors", "colour", "colours", "theme"):
+        self.term_html(
+            f"<span style='color:{PROMPT};font-weight:bold'>bankser@desktop"
+            f"</span><span style='color:{TEXT_MUTED}'>:"
+            f"{html.escape(self.short_cwd())}$</span> "
+            f"<span style='color:{TEXT}'>{html.escape(command)}</span>"
+        )
 
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
+        if self.run_extra_command(name, rest):
+            return
+
+        if name in ("color", "colors", "colour", "colours", "theme"):
 
             arguments = command.split()[1:]
 
@@ -4882,10 +6795,6 @@ class BankserDesktop(QMainWindow):
 
         if name in ("ai", "bankserai", "assistant"):
             self.open_bankserai()
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             self.term_write("bankserAI launched.")
 
             model = get_local_model()
@@ -4900,38 +6809,22 @@ class BankserDesktop(QMainWindow):
 
         if name in ("art", "paint", "draw"):
             self.open_art()
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             self.term_write("ART Studio launched.")
             return
 
         if name in ("pasteshell", "ps"):
             self.open_pasteshell()
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             self.term_write("PASTESHELL launched.")
             return
 
         if name in ("matrix", "matrixrain", "rain", "cmatrix"):
             self.open_matrix()
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             self.term_write("MATRIX RAIN launched.")
             self.term_write("Hotkeys: q quit · 0-9 speed · a async · b bold")
             return
 
         if name in ("ipsea", "weakwifi"):
             self.open_pasteshell()
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             if name == "ipsea":
                 self.paste_window.start_network_scan()
                 self.term_write("IPSEA scan running inside PASTESHELL.")
@@ -4942,10 +6835,6 @@ class BankserDesktop(QMainWindow):
 
         if name in ("-welcome", "--welcome", "welcome"):
             self.zoom_panel(self.terminal_win)
-            self.term_html(
-                f"<span style='color:{PROMPT}'>"
-                f"bankser@desktop:~$ {html.escape(command)}</span>"
-            )
             self.show_welcome()
             return
 
@@ -4961,12 +6850,28 @@ class BankserDesktop(QMainWindow):
                 "  pasteshell    launch the PASTESHELL tool\n"
                 "  ipsea         scan the local network\n"
                 "  weakwifi      list nearby Wi-Fi networks\n"
+                "  neofetch      system info with the BANKSER' logo\n"
+                "  calc <expr>   calculator, e.g. calc sqrt(2)*10\n"
+                "  ls [path]     list a folder\n"
+                "  cd <path>     change folder (Filecore follows)\n"
+                "  pwd           show the current folder\n"
+                "  open <app>    open any desktop app by name\n"
+                "  top           busiest processes right now\n"
+                "  uptime        system and session uptime\n"
+                "  history       commands typed this session\n"
+                "  echo <text>   print text\n"
+                "  notify <text> pop a desktop notification\n"
+                "  boot          replay the holographic boot sequence\n"
+                "  whoami        current user\n"
                 "  date          current date and time\n"
                 "  system        platform information\n"
                 "  files         list ~/.bankser\n"
                 "  clear         clear the terminal\n"
                 "  open-home     open the BANKSER' home folder\n"
-                "  website       open a browser"
+                "  website       open a browser\n"
+                "\n"
+                "Shortcuts: Ctrl+Space apps · Ctrl+Alt+T terminal · "
+                "Ctrl+Alt+F files · Ctrl+S save notes · F11 fullscreen"
             ),
 
             "date": datetime.now().strftime(
@@ -4989,11 +6894,6 @@ class BankserDesktop(QMainWindow):
         }
 
         result = commands.get(name, f"Command not found: {name}. Type help.")
-
-        self.term_html(
-            f"<span style='color:{PROMPT}'>"
-            f"bankser@desktop:~$ {html.escape(command)}</span>"
-        )
         self.term_write(result)
 
         if name == "open-home":
@@ -5021,7 +6921,8 @@ def main():
 
     desktop = BankserDesktop()
 
-    boot = BootScreen(lambda: desktop.showFullScreen())
+    screen_class = HudBootScreen if BOOT_STYLE == "hud" else BootScreen
+    boot = screen_class(lambda: desktop.showFullScreen())
     boot.showFullScreen()
 
     sys.exit(app.exec())
